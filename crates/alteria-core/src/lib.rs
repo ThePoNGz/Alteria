@@ -6,3 +6,6 @@
 //! function over plain data, fully unit-testable without a window.
 //!
 //! Modules are added one concept per file as the engine is built (see plan 001).
+
+pub mod action;
+pub mod input;
