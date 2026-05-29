@@ -8,5 +8,6 @@
 //! Modules are added one concept per file as the engine is built (see plan 001).
 
 pub mod action;
+pub mod buffer;
 pub mod input;
 pub mod selection;
