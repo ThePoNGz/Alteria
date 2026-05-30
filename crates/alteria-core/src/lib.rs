@@ -11,5 +11,6 @@ pub mod action;
 pub mod buffer;
 pub mod input;
 pub mod keymap;
+pub mod resolver;
 pub mod selection;
 pub mod transaction;
