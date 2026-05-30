@@ -64,33 +64,49 @@ fn insert_text(buffer: &mut Buffer, history: &mut History, s: &str) {
     apply_edit(buffer, history, changes, targets);
 }
 
-/// Delete the char before every cursor's head (cursors at the start contribute
-/// nothing; if none can delete, it is a no-op). Per `KEYMAP.md`'s Base layer,
-/// `Backspace` deletes the grapheme before `head` (M0: one char) — typing, not
-/// backspace, is the path that replaces a selected span.
+/// `Backspace`: a non-empty selection is deleted whole (standard editor
+/// behavior — without Alt held, Alteria is a normal editor); a bare cursor
+/// deletes the char before its head (a cursor at the buffer start contributes
+/// nothing). If nothing can be deleted it is a no-op.
 fn delete_backward(buffer: &mut Buffer, history: &mut History) {
-    let mut changes = Vec::new();
-    for head in head_points(buffer) {
-        let head_char = buffer.text.byte_to_char(head);
-        if head_char == 0 {
-            continue;
+    // Per-range deletion intervals, plus where each range's caret should land.
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    let mut targets: Vec<usize> = Vec::new();
+    for r in &buffer.selection.ranges {
+        if r.is_empty() {
+            let head = r.head;
+            let head_char = buffer.text.byte_to_char(head);
+            if head_char == 0 {
+                targets.push(head); // at the buffer start: nothing to delete
+            } else {
+                let from = buffer.text.char_to_byte(head_char - 1);
+                intervals.push((from, head));
+                targets.push(head); // map_pos lands it on the deletion start
+            }
+        } else {
+            // A selection is removed whole; the caret lands at its start.
+            intervals.push((r.min(), r.max()));
+            targets.push(r.min());
         }
-        let from = buffer.text.char_to_byte(head_char - 1);
-        changes.push((from, head, String::new()));
     }
-    if changes.is_empty() {
-        return;
+    if intervals.is_empty() {
+        return; // every cursor at the buffer start: no-op
     }
-    let targets: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.head).collect();
+    // Merge overlapping intervals so the changeset stays non-overlapping: a bare
+    // cursor can sit on the shared edge of a neighbouring span's deletion.
+    intervals.sort_by_key(|iv| iv.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+    for iv in intervals {
+        match merged.last_mut() {
+            Some(last) if iv.0 < last.1 => last.1 = last.1.max(iv.1),
+            _ => merged.push(iv),
+        }
+    }
+    let changes: Vec<(usize, usize, String)> = merged
+        .into_iter()
+        .map(|(a, b)| (a, b, String::new()))
+        .collect();
     apply_edit(buffer, history, changes, targets);
-}
-
-/// The distinct head offsets of the current selection, sorted ascending.
-fn head_points(buffer: &Buffer) -> Vec<usize> {
-    let mut heads: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.head).collect();
-    heads.sort_unstable();
-    heads.dedup();
-    heads
 }
 
 /// Build one changeset spanning all `changes` (in old coordinates), record its
@@ -611,6 +627,37 @@ mod tests {
         run(&mut b, Action::DeleteBackward);
         assert_eq!(b.text, "ab");
         assert_eq!(head(&b), 1);
+    }
+
+    #[test]
+    fn backspace_over_a_span_deletes_the_selection() {
+        // Without Alt, Alteria is a normal editor: Backspace over a selection
+        // removes the whole span, not just one char.
+        let mut b = span("abcde", 1, 4); // "bcd" selected
+        run(&mut b, Action::DeleteBackward);
+        assert_eq!(b.text, "ae");
+        assert_eq!(b.selection.primary(), Range::cursor(1)); // caret at the span start
+    }
+
+    #[test]
+    fn backspace_over_a_backward_span_deletes_the_selection() {
+        let mut b = span("abcde", 4, 1); // same span, head left of anchor
+        run(&mut b, Action::DeleteBackward);
+        assert_eq!(b.text, "ae");
+        assert_eq!(b.selection.primary(), Range::cursor(1));
+    }
+
+    #[test]
+    fn backspace_over_multiple_spans_deletes_each() {
+        // "abcdef": spans "ab" [0,2) and "ef" [4,6) -> "cd".
+        let mut b = Buffer::from_str("abcdef");
+        b.selection = Selection {
+            ranges: vec![Range { anchor: 0, head: 2 }, Range { anchor: 4, head: 6 }],
+            primary: 0,
+        };
+        run(&mut b, Action::DeleteBackward);
+        assert_eq!(b.text, "cd");
+        assert_eq!(heads(&b), vec![0, 2]);
     }
 
     #[test]
