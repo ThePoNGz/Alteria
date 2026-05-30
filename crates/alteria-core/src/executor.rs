@@ -7,8 +7,9 @@
 //! (M0; grapheme/column-memory refinement is later). Every motion clamps at the
 //! buffer edges and never panics.
 //!
-//! Task 8 operates on the **primary** range only; multicursor generalization is
-//! Task 9.
+//! Multicursor: one edit builds a single [`ChangeSet`] over every range in the
+//! old coordinate space, applies it once, then maps every range into the new
+//! space and merges overlaps — so one keystroke edits all cursors atomically.
 
 use ropey::Rope;
 
@@ -16,7 +17,7 @@ use crate::action::{Action, Direction, Motion};
 use crate::buffer::Buffer;
 use crate::history::{History, Transaction};
 use crate::selection::{Range, Selection};
-use crate::transaction::ChangeSet;
+use crate::transaction::{Assoc, ChangeSet};
 
 /// Apply one action to the buffer, recording text edits in `history`.
 pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
@@ -29,14 +30,14 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
             motion,
             extend,
             count,
-        } => move_primary(buffer, motion, extend, count),
+        } => move_all(buffer, motion, extend, count),
+        Action::SpawnCursor(dir) => spawn_cursor(buffer, dir),
         Action::Undo => {
             history.undo(buffer);
         }
         // Implemented in later tasks:
         Action::Expand(_) => {}                                   // Task 10
         Action::FindChar { .. } | Action::FindRepeat { .. } => {} // Task 11
-        Action::SpawnCursor(_) => {}                              // Task 9
     }
 }
 
@@ -44,54 +45,76 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
 // Edits — every text change flows through a ChangeSet committed to history.
 // ---------------------------------------------------------------------------
 
-/// Insert `s` at the primary head, advance past it, and collapse to a cursor.
+/// Insert `s` at every cursor's head, advance past it, and collapse.
 fn insert_text(buffer: &mut Buffer, history: &mut History, s: &str) {
-    let head = buffer.selection.primary().head;
-    apply_edit(
-        buffer,
-        history,
-        &[(head, head, s.to_string())],
-        Selection::at(head + s.len()),
-    );
+    let mut heads = head_points(buffer);
+    let changes: Vec<(usize, usize, String)> =
+        heads.drain(..).map(|p| (p, p, s.to_string())).collect();
+    apply_edit(buffer, history, changes);
 }
 
-/// Delete the char before the primary head (no-op at the buffer start).
+/// Delete the char before every cursor's head (cursors at the start contribute
+/// nothing; if none can delete, it is a no-op).
 fn delete_backward(buffer: &mut Buffer, history: &mut History) {
-    let head = buffer.selection.primary().head;
-    let head_char = buffer.text.byte_to_char(head);
-    if head_char == 0 {
+    let mut changes = Vec::new();
+    for head in head_points(buffer) {
+        let head_char = buffer.text.byte_to_char(head);
+        if head_char == 0 {
+            continue;
+        }
+        let from = buffer.text.char_to_byte(head_char - 1);
+        changes.push((from, head, String::new()));
+    }
+    if changes.is_empty() {
         return;
     }
-    let from = buffer.text.char_to_byte(head_char - 1);
-    apply_edit(
-        buffer,
-        history,
-        &[(from, head, String::new())],
-        Selection::at(from),
-    );
+    apply_edit(buffer, history, changes);
 }
 
-/// Build a changeset for `changes`, record its inverse + selections in history,
-/// apply it, and set the new selection.
+/// The distinct head offsets of the current selection, sorted ascending.
+fn head_points(buffer: &Buffer) -> Vec<usize> {
+    let mut heads: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.head).collect();
+    heads.sort_unstable();
+    heads.dedup();
+    heads
+}
+
+/// Build one changeset spanning all `changes` (in old coordinates), record its
+/// inverse + selections in history, apply it once, then map every range's head
+/// into the new space and merge overlaps. Each range collapses to a cursor —
+/// `KEYMAP.md` has both typing and backspace drop any span.
 fn apply_edit(
     buffer: &mut Buffer,
     history: &mut History,
-    changes: &[(usize, usize, String)],
-    new_selection: Selection,
+    mut changes: Vec<(usize, usize, String)>,
 ) {
+    changes.sort_by_key(|c| c.0);
     let before_text = buffer.text.clone();
     let selection_before = buffer.selection.clone();
-    let forward = ChangeSet::from_changes(before_text.len_bytes(), changes);
+    let forward = ChangeSet::from_changes(before_text.len_bytes(), &changes);
     let inverse = forward.invert(&before_text);
+
+    // Map every head through the one changeset. `After` keeps a cursor past
+    // inserted text; at a deletion's right edge it lands on the deletion start.
+    let mut after = Selection {
+        ranges: selection_before
+            .ranges
+            .iter()
+            .map(|r| Range::cursor(forward.map_pos(r.head, Assoc::After)))
+            .collect(),
+        primary: selection_before.primary,
+    };
+
     if !forward.apply(&mut buffer.text) {
         return; // malformed (should not happen for executor-built changes)
     }
-    buffer.selection = new_selection.clone();
+    after.normalize();
+    buffer.selection = after.clone();
     history.commit(Transaction {
         forward,
         inverse,
         selection_before,
-        selection_after: new_selection,
+        selection_after: after,
     });
 }
 
@@ -105,22 +128,46 @@ fn collapse(buffer: &mut Buffer) {
     buffer.selection = Selection::at(head);
 }
 
-/// Move the primary head `count` times, extending or collapsing.
-fn move_primary(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
-    let range = buffer.selection.primary();
-    let new_head = move_head(&buffer.text, range.head, motion, count);
-    let new_range = if extend {
-        Range {
-            anchor: range.anchor,
-            head: new_head,
-        }
-    } else {
-        Range::cursor(new_head)
+/// Move every range's head `count` times, extending or collapsing, then merge
+/// any ranges that now coincide.
+fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
+    let mut moved = Selection {
+        ranges: buffer
+            .selection
+            .ranges
+            .iter()
+            .map(|r| {
+                let new_head = move_head(&buffer.text, r.head, motion, count);
+                if extend {
+                    Range {
+                        anchor: r.anchor,
+                        head: new_head,
+                    }
+                } else {
+                    Range::cursor(new_head)
+                }
+            })
+            .collect(),
+        primary: buffer.selection.primary,
     };
-    buffer.selection = Selection {
-        ranges: vec![new_range],
-        primary: 0,
-    };
+    moved.normalize();
+    buffer.selection = moved;
+}
+
+/// Provisional (`KEYMAP.md` "not yet specified"): add a bare cursor one line
+/// above/below the primary at the same column and make it the new primary, so
+/// repeated spawns build a column. No-op when there is no line that way.
+fn spawn_cursor(buffer: &mut Buffer, dir: Direction) {
+    let primary = buffer.selection.primary();
+    let new_head = vertical(&buffer.text, primary.head, matches!(dir, Direction::Up));
+    if new_head == primary.head {
+        return;
+    }
+    let mut sel = buffer.selection.clone();
+    sel.ranges.push(Range::cursor(new_head));
+    sel.primary = sel.ranges.len() - 1;
+    sel.normalize();
+    buffer.selection = sel;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +398,17 @@ mod tests {
             primary: 0,
         };
         b
+    }
+    fn cursors(text: &str, heads: &[usize]) -> Buffer {
+        let mut b = Buffer::from_str(text);
+        b.selection = Selection {
+            ranges: heads.iter().map(|&h| Range::cursor(h)).collect(),
+            primary: 0,
+        };
+        b
+    }
+    fn heads(b: &Buffer) -> Vec<usize> {
+        b.selection.ranges.iter().map(|r| r.head).collect()
     }
     fn mv(motion: Motion, extend: bool, count: usize) -> Action {
         Action::Move {
@@ -622,6 +680,70 @@ mod tests {
         apply(Action::Undo, &mut b, &mut h);
         assert_eq!(b.text, "abc");
         assert_eq!(b.selection.primary(), Range::cursor(0));
+    }
+
+    // ---- multicursor ----------------------------------------------------
+
+    #[test]
+    fn two_cursors_insert_at_both() {
+        let mut b = cursors("abcde", &[1, 3]);
+        run(&mut b, Action::InsertChar('X'));
+        assert_eq!(b.text, "aXbcXde");
+        assert_eq!(heads(&b), vec![2, 5]);
+    }
+
+    #[test]
+    fn motion_moves_every_cursor() {
+        let mut b = cursors("abcde", &[0, 2]);
+        run(&mut b, mv(Char(Direction::Right), false, 1));
+        assert_eq!(heads(&b), vec![1, 3]);
+    }
+
+    #[test]
+    fn edit_that_makes_cursors_coincide_merges_them() {
+        // cursors at 1 and 2: deleting before each removes "ab" -> both land at 0
+        let mut b = cursors("abc", &[1, 2]);
+        run(&mut b, Action::DeleteBackward);
+        assert_eq!(b.text, "c");
+        assert_eq!(b.selection.ranges.len(), 1);
+        assert_eq!(b.selection.primary(), Range::cursor(0));
+    }
+
+    #[test]
+    fn esc_collapses_multicursor_to_the_primary() {
+        let mut b = Buffer::from_str("abcde");
+        b.selection = Selection {
+            ranges: vec![Range { anchor: 1, head: 2 }, Range { anchor: 3, head: 4 }],
+            primary: 1,
+        };
+        run(&mut b, Action::CollapseSelection);
+        assert_eq!(b.selection.ranges.len(), 1);
+        assert_eq!(b.selection.primary(), Range::cursor(4)); // primary head
+    }
+
+    #[test]
+    fn spawn_cursor_down_adds_a_cursor_below_at_same_column() {
+        let mut b = at("abc\ndef", 1); // line0, col1
+        run(&mut b, Action::SpawnCursor(Direction::Down));
+        let mut hs = heads(&b);
+        hs.sort_unstable();
+        assert_eq!(hs, vec![1, 5]); // line1 col1 = byte 5
+    }
+
+    #[test]
+    fn spawn_cursor_up_adds_a_cursor_above() {
+        let mut b = at("abc\ndef", 5); // line1, col1
+        run(&mut b, Action::SpawnCursor(Direction::Up));
+        let mut hs = heads(&b);
+        hs.sort_unstable();
+        assert_eq!(hs, vec![1, 5]);
+    }
+
+    #[test]
+    fn spawn_cursor_noop_at_buffer_edge() {
+        let mut b = at("abc", 1); // only one line
+        run(&mut b, Action::SpawnCursor(Direction::Up));
+        assert_eq!(b.selection.ranges.len(), 1);
     }
 
     // ---- empty buffer ---------------------------------------------------
