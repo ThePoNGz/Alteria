@@ -13,8 +13,9 @@
 
 use ropey::Rope;
 
-use crate::action::{Action, Direction, Motion};
+use crate::action::{Action, Direction, Expansion, Motion};
 use crate::buffer::Buffer;
+use crate::expand;
 use crate::history::{History, Transaction};
 use crate::selection::{Range, Selection};
 use crate::transaction::{Assoc, ChangeSet};
@@ -32,11 +33,11 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
             count,
         } => move_all(buffer, motion, extend, count),
         Action::SpawnCursor(dir) => spawn_cursor(buffer, dir),
+        Action::Expand(kind) => expand_primary(buffer, history, kind),
         Action::Undo => {
             history.undo(buffer);
         }
-        // Implemented in later tasks:
-        Action::Expand(_) => {}                                   // Task 10
+        // Implemented in a later task:
         Action::FindChar { .. } | Action::FindRepeat { .. } => {} // Task 11
     }
 }
@@ -152,6 +153,30 @@ fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
     };
     moved.normalize();
     buffer.selection = moved;
+}
+
+/// `I`/`U`/`O`/`P`: expand the primary range one level and record a
+/// selection-only history entry (identity changeset) so `Ctrl+Z` steps back
+/// through expansions too. Outermost level is a no-op (no history entry).
+fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
+    let primary = buffer.selection.primary();
+    let new_range = expand::expand(&buffer.text, primary, kind);
+    if new_range == primary {
+        return;
+    }
+    let selection_before = buffer.selection.clone();
+    let mut after = buffer.selection.clone();
+    let p = after.primary;
+    after.ranges[p] = new_range;
+    buffer.selection = after.clone();
+
+    let id = ChangeSet::identity(buffer.text.len_bytes());
+    history.commit(Transaction {
+        forward: id.clone(),
+        inverse: id,
+        selection_before,
+        selection_after: after,
+    });
 }
 
 /// Provisional (`KEYMAP.md` "not yet specified"): add a bare cursor one line
@@ -744,6 +769,39 @@ mod tests {
         let mut b = at("abc", 1); // only one line
         run(&mut b, Action::SpawnCursor(Direction::Up));
         assert_eq!(b.selection.ranges.len(), 1);
+    }
+
+    // ---- expansion (wired through the executor, undoable) ---------------
+
+    #[test]
+    fn expand_updates_primary_and_is_undoable() {
+        let mut b = at("a aa b", 2); // cursor in "aa"
+        let mut h = History::new();
+
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
+        assert_eq!(b.selection.primary(), Range { anchor: 2, head: 4 }); // "aa"
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
+        let p = b.selection.primary();
+        assert_eq!((p.min(), p.max()), (2, 6)); // "aa b"
+
+        // Ctrl+Z steps back through the expansion levels; text never changed.
+        apply(Action::Undo, &mut b, &mut h);
+        let p = b.selection.primary();
+        assert_eq!((p.min(), p.max()), (2, 4));
+        apply(Action::Undo, &mut b, &mut h);
+        assert_eq!(b.selection.primary(), Range::cursor(2));
+        assert_eq!(b.text, "a aa b");
+    }
+
+    #[test]
+    fn expand_at_outermost_does_not_commit_history() {
+        let mut b = at("abc", 1);
+        let mut h = History::new();
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h); // word "abc"
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h); // outermost: no-op
+                                                                     // A second Undo would be the no-op root if the no-op did not commit.
+        assert!(h.undo(&mut b)); // undoes the word selection
+        assert!(!h.undo(&mut b)); // root: nothing more
     }
 
     // ---- empty buffer ---------------------------------------------------

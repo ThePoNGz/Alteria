@@ -10,6 +10,7 @@
 pub mod action;
 pub mod buffer;
 pub mod executor;
+pub mod expand;
 pub mod history;
 pub mod input;
 pub mod keymap;
