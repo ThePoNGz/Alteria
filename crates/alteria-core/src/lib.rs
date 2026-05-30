@@ -9,6 +9,7 @@
 
 pub mod action;
 pub mod buffer;
+pub mod history;
 pub mod input;
 pub mod keymap;
 pub mod resolver;
