@@ -64,8 +64,8 @@ pub enum Action {
     },
     /// `Alt+F` then a char — jump to the next occurrence on the current line.
     FindChar { ch: char },
-    /// `A`/`D` while find is active — repeat the search in a direction.
-    FindRepeat { forward: bool },
+    /// `A`/`D` while find is active — repeat the search for the same target.
+    FindRepeat { ch: char, forward: bool },
     /// `I`/`U`/`O`/`P` — expand the selection one level.
     Expand(Expansion),
     /// `Alt+Ctrl` `W`/`S` — spawn a cursor above/below (provisional spec).

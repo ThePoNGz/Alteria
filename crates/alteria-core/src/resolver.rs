@@ -109,10 +109,10 @@ impl Resolver {
         // 2. Find repeat: A/D step while find is active; any other key ends find
         //    and is then handled normally.
         if mods.alt {
-            if let FindState::Active { .. } = self.find {
+            if let FindState::Active { ch } = self.find {
                 match command_char(key) {
-                    Key::Char('d') => return Some(Action::FindRepeat { forward: true }),
-                    Key::Char('a') => return Some(Action::FindRepeat { forward: false }),
+                    Key::Char('d') => return Some(Action::FindRepeat { ch, forward: true }),
+                    Key::Char('a') => return Some(Action::FindRepeat { ch, forward: false }),
                     _ => self.find = FindState::Inactive,
                 }
             }
@@ -379,11 +379,17 @@ mod tests {
         assert_eq!(r.find_state(), FindState::Active { ch: 'x' });
         assert_eq!(
             r.resolve(down(Key::Char('d'), ALT), &k),
-            Some(Action::FindRepeat { forward: true })
+            Some(Action::FindRepeat {
+                ch: 'x',
+                forward: true
+            })
         );
         assert_eq!(
             r.resolve(down(Key::Char('a'), ALT), &k),
-            Some(Action::FindRepeat { forward: false })
+            Some(Action::FindRepeat {
+                ch: 'x',
+                forward: false
+            })
         );
     }
 

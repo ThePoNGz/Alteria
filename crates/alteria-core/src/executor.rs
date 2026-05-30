@@ -16,6 +16,7 @@ use ropey::Rope;
 use crate::action::{Action, Direction, Expansion, Motion};
 use crate::buffer::Buffer;
 use crate::expand;
+use crate::find;
 use crate::history::{History, Transaction};
 use crate::selection::{Range, Selection};
 use crate::transaction::{Assoc, ChangeSet};
@@ -34,11 +35,11 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
         } => move_all(buffer, motion, extend, count),
         Action::SpawnCursor(dir) => spawn_cursor(buffer, dir),
         Action::Expand(kind) => expand_primary(buffer, history, kind),
+        Action::FindChar { ch } => find_move(buffer, ch, true),
+        Action::FindRepeat { ch, forward } => find_move(buffer, ch, forward),
         Action::Undo => {
             history.undo(buffer);
         }
-        // Implemented in a later task:
-        Action::FindChar { .. } | Action::FindRepeat { .. } => {} // Task 11
     }
 }
 
@@ -177,6 +178,16 @@ fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
         selection_before,
         selection_after: after,
     });
+}
+
+/// `Alt+F` find: move the primary caret to the next/previous occurrence of `ch`
+/// on its line, collapsing to a single cursor. No match leaves the caret put.
+/// Find is a motion, so it is not recorded in history.
+fn find_move(buffer: &mut Buffer, ch: char, forward: bool) {
+    let head = buffer.selection.primary().head;
+    if let Some(new_head) = find::find_on_line(&buffer.text, head, ch, forward) {
+        buffer.selection = Selection::at(new_head);
+    }
 }
 
 /// Provisional (`KEYMAP.md` "not yet specified"): add a bare cursor one line
@@ -769,6 +780,43 @@ mod tests {
         let mut b = at("abc", 1); // only one line
         run(&mut b, Action::SpawnCursor(Direction::Up));
         assert_eq!(b.selection.ranges.len(), 1);
+    }
+
+    // ---- find -----------------------------------------------------------
+
+    #[test]
+    fn find_moves_to_occurrence_then_repeats_both_ways() {
+        // a0 ' '1 x2 ' '3 b4 ' '5 x6 ' '7 c8
+        let mut b = at("a x b x c", 0);
+        let mut h = History::new();
+        apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
+        assert_eq!(head(&b), 2);
+        apply(
+            Action::FindRepeat {
+                ch: 'x',
+                forward: true,
+            },
+            &mut b,
+            &mut h,
+        );
+        assert_eq!(head(&b), 6);
+        apply(
+            Action::FindRepeat {
+                ch: 'x',
+                forward: false,
+            },
+            &mut b,
+            &mut h,
+        );
+        assert_eq!(head(&b), 2);
+    }
+
+    #[test]
+    fn find_no_match_is_a_noop() {
+        let mut b = at("abc", 0);
+        let mut h = History::new();
+        apply(Action::FindChar { ch: 'z' }, &mut b, &mut h);
+        assert_eq!(head(&b), 0);
     }
 
     // ---- expansion (wired through the executor, undoable) ---------------
