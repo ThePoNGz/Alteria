@@ -118,18 +118,24 @@ impl Resolver {
             }
         }
 
-        // 3. Begin find.
+        // 3. Begin find. Entering the find sub-mode consumes any pending count
+        //    (a count is for the next motion, not for a find that intervenes).
         if mods.alt && command_char(key) == Key::Char('f') {
+            self.count = 0;
             self.find = FindState::Pending;
             return None;
         }
 
-        // 4. Repeat count: Alt + 1..9 accumulate.
+        // 4. Repeat count: Alt + digit accumulates. A leading `0` is not a count
+        //    (there is no zero-times motion), but `0` continues an in-progress
+        //    count, so 10, 20, 200, ... are reachable.
         if mods.alt {
             if let Key::Char(c) = key {
-                if let Some(d @ 1..=9) = c.to_digit(10) {
-                    self.count = self.count * 10 + d as usize;
-                    return None;
+                if let Some(d) = c.to_digit(10) {
+                    if d != 0 || self.count > 0 {
+                        self.count = self.count * 10 + d as usize;
+                        return None;
+                    }
                 }
             }
         }
@@ -352,6 +358,56 @@ mod tests {
         assert_eq!(
             r.resolve(down(Key::Char('w'), ALT), &k),
             mv(Motion::Char(Direction::Up), false, 12)
+        );
+    }
+
+    #[test]
+    fn count_accumulates_a_trailing_zero() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(ALT), &k);
+        r.resolve(down(Key::Char('1'), ALT), &k);
+        r.resolve(down(Key::Char('0'), ALT), &k);
+        assert_eq!(r.pending_count(), 10);
+        assert_eq!(
+            r.resolve(down(Key::Char('w'), ALT), &k),
+            mv(Motion::Char(Direction::Up), false, 10)
+        );
+    }
+
+    #[test]
+    fn count_accumulates_two_hundred() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(ALT), &k);
+        for d in ['2', '0', '0'] {
+            r.resolve(down(Key::Char(d), ALT), &k);
+        }
+        assert_eq!(r.pending_count(), 200);
+    }
+
+    #[test]
+    fn a_leading_zero_is_not_a_count_digit() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(ALT), &k);
+        assert_eq!(r.resolve(down(Key::Char('0'), ALT), &k), None);
+        assert_eq!(r.pending_count(), 0);
+    }
+
+    #[test]
+    fn entering_find_clears_a_pending_count() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(ALT), &k);
+        r.resolve(down(Key::Char('5'), ALT), &k); // count 5
+        r.resolve(down(Key::Char('f'), ALT), &k); // begin find -> clears count
+        assert_eq!(r.pending_count(), 0);
+        r.resolve(down(Key::Char('x'), ALT), &k); // find target
+                                                  // A later motion uses count 1, not the leaked 5.
+        assert_eq!(
+            r.resolve(down(Key::Char('w'), ALT), &k),
+            mv(Motion::Char(Direction::Up), false, 1)
         );
     }
 

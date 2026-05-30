@@ -162,13 +162,17 @@ fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
 fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
     let primary = buffer.selection.primary();
     let new_range = expand::expand(&buffer.text, primary, kind);
-    if new_range == primary {
+    // Compare by span, not orientation: `expand` returns a forward range, so a
+    // backward primary at the outermost level must still be recognized as a
+    // no-op (no orientation flip, no spurious history entry).
+    if new_range.min() == primary.min() && new_range.max() == primary.max() {
         return;
     }
     let selection_before = buffer.selection.clone();
     let mut after = buffer.selection.clone();
     let p = after.primary;
     after.ranges[p] = new_range;
+    after.normalize(); // a wider primary may now swallow a sibling cursor
     buffer.selection = after.clone();
 
     let id = ChangeSet::identity(buffer.text.len_bytes());
@@ -362,52 +366,94 @@ fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
     }
 }
 
-/// Jump from a bracket at `head` to its partner (nesting-aware, across lines).
-/// Returns `None` when `head` is not on a bracket character.
+/// Jump from a bracket at `head` to its partner; or, when `head` is **inside** a
+/// pair but not on a delimiter, to the enclosing pair's close (`KEYMAP.md`:
+/// on/inside). Nesting-aware and across lines. `None` if there is no bracket to
+/// act on.
 fn matching_bracket(text: &Rope, head: usize) -> Option<usize> {
     let hc = text.byte_to_char(head);
+    if let Some(here) = text.get_char(hc) {
+        match here {
+            '(' | '[' | '{' => return close_for(text, hc).map(|i| text.char_to_byte(i)),
+            ')' | ']' | '}' => return open_for(text, hc).map(|i| text.char_to_byte(i)),
+            _ => {}
+        }
+    }
+    // Not on a delimiter: jump to the close of the pair that encloses `head`.
+    let op = enclosing_open(text, hc)?;
+    close_for(text, op).map(|i| text.char_to_byte(i))
+}
+
+/// The matching close for the opening bracket at char index `open` (else `None`).
+fn close_for(text: &Rope, open: usize) -> Option<usize> {
+    let open_c = text.get_char(open)?;
+    let close_c = match open_c {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    };
     let len = text.len_chars();
-    let here = text.get_char(hc)?;
-    let (open, close, forward) = match here {
-        '(' => ('(', ')', true),
-        '[' => ('[', ']', true),
-        '{' => ('{', '}', true),
-        ')' => ('(', ')', false),
-        ']' => ('[', ']', false),
-        '}' => ('{', '}', false),
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < len {
+        let ch = text.char(i);
+        if ch == open_c {
+            depth += 1;
+        } else if ch == close_c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The matching open for the closing bracket at char index `close` (else `None`).
+fn open_for(text: &Rope, close: usize) -> Option<usize> {
+    let close_c = text.get_char(close)?;
+    let open_c = match close_c {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
         _ => return None,
     };
     let mut depth = 0i32;
-    if forward {
-        let mut i = hc;
-        while i < len {
-            let ch = text.char(i);
-            if ch == open {
-                depth += 1;
-            } else if ch == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text.char_to_byte(i));
-                }
+    let mut i = close;
+    loop {
+        let ch = text.char(i);
+        if ch == close_c {
+            depth += 1;
+        } else if ch == open_c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
             }
-            i += 1;
         }
-    } else {
-        let mut i = hc;
-        loop {
-            let ch = text.char(i);
-            if ch == close {
-                depth += 1;
-            } else if ch == open {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text.char_to_byte(i));
-                }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    None
+}
+
+/// The nearest opening bracket enclosing char index `from` (scanning left).
+fn enclosing_open(text: &Rope, from: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = from;
+    while i > 0 {
+        i -= 1;
+        let ch = text.char(i);
+        if matches!(ch, ')' | ']' | '}') {
+            depth += 1;
+        } else if matches!(ch, '(' | '[' | '{') {
+            if depth == 0 {
+                return Some(i);
             }
-            if i == 0 {
-                break;
-            }
-            i -= 1;
+            depth -= 1;
         }
     }
     None
@@ -680,6 +726,16 @@ mod tests {
         assert_eq!(head(&b), 1);
     }
 
+    #[test]
+    fn matching_bracket_from_inside_a_pair() {
+        // (abc): '('=0 a=1 b=2 c=3 ')'=4 ; cursor on 'b' (byte 2), inside the pair
+        let mut b = at("(abc)", 2);
+        run(&mut b, mv(MatchingBracket, false, 1));
+        assert_eq!(head(&b), 4); // jumps to the enclosing pair's ')'
+        run(&mut b, mv(MatchingBracket, false, 1));
+        assert_eq!(head(&b), 0); // and from the ')' back to the '('
+    }
+
     // ---- extend / count / collapse -------------------------------------
 
     #[test]
@@ -850,6 +906,37 @@ mod tests {
                                                                      // A second Undo would be the no-op root if the no-op did not commit.
         assert!(h.undo(&mut b)); // undoes the word selection
         assert!(!h.undo(&mut b)); // root: nothing more
+    }
+
+    #[test]
+    fn expand_outermost_backward_selection_is_a_strict_noop() {
+        // A right-to-left selection of the whole word (reachable via Alt+Shift
+        // extend-left) must be a true no-op at the outermost level: no history
+        // entry and no orientation flip.
+        let mut b = Buffer::from_str("abc");
+        b.selection = Selection {
+            ranges: vec![Range { anchor: 3, head: 0 }],
+            primary: 0,
+        };
+        let mut h = History::new();
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
+        assert_eq!(b.selection.primary(), Range { anchor: 3, head: 0 }); // unchanged
+        assert!(!h.undo(&mut b)); // nothing committed: at the root
+    }
+
+    #[test]
+    fn expand_normalizes_overlap_with_a_sibling_cursor() {
+        // Two cursors; expanding the primary into a word swallows the sibling.
+        let mut b = Buffer::from_str("a aa b");
+        b.selection = Selection {
+            ranges: vec![Range::cursor(2), Range::cursor(3)],
+            primary: 0,
+        };
+        let mut h = History::new();
+        apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
+        assert_eq!(b.selection.ranges.len(), 1);
+        let p = b.selection.primary();
+        assert_eq!((p.min(), p.max()), (2, 4)); // "aa"
     }
 
     // ---- empty buffer ---------------------------------------------------

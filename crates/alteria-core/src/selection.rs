@@ -97,10 +97,17 @@ impl Selection {
             }
         }
 
-        // The primary is the merged range whose span contains the old primary.
+        // Keep the primary: prefer the surviving identical range (so a bare
+        // cursor sharing an edge with a span isn't reassigned to the span), and
+        // only fall back to containment for a primary that was merged away.
         let new_primary = merged
             .iter()
-            .position(|r| r.min() <= primary.min() && primary.max() <= r.max())
+            .position(|r| *r == primary)
+            .or_else(|| {
+                merged
+                    .iter()
+                    .position(|r| r.min() <= primary.min() && primary.max() <= r.max())
+            })
             .unwrap_or(0);
 
         self.ranges = merged;
@@ -200,6 +207,19 @@ mod tests {
         s.normalize();
         assert_eq!(s.ranges.len(), 1);
         assert_eq!(s.ranges[0], Range::cursor(4));
+    }
+
+    #[test]
+    fn normalize_keeps_a_zero_width_primary_off_a_shared_edge() {
+        // A bare primary cursor at 4 sits on the far edge of an earlier span
+        // [2,4); it must stay the primary, not be reassigned to the span.
+        let mut s = Selection {
+            ranges: vec![Range { anchor: 2, head: 4 }, Range::cursor(4)],
+            primary: 1,
+        };
+        s.normalize();
+        assert_eq!(s.ranges.len(), 2); // they touch but do not overlap
+        assert_eq!(s.primary(), Range::cursor(4));
     }
 
     #[test]
