@@ -204,8 +204,9 @@ mod tests {
             },
             (0, 3)
         );
-        e.key('x', Modifiers::NONE); // insert at head -> "foox"
-        assert_eq!(e.buffer.text, "foox");
+        e.key('x', Modifiers::NONE); // typing replaces the selection -> "x"
+        assert_eq!(e.buffer.text, "x");
+        assert_eq!(e.head(), 1);
 
         // Ctrl+Z undoes the edit (text + selection)...
         e.hold(CTRL);

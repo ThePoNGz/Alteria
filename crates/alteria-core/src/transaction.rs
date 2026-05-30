@@ -201,6 +201,16 @@ impl ChangeSet {
                 Op::Delete(n) => {
                     // Recover the removed bytes from the original to re-insert.
                     let end = byte_pos + n;
+                    // A forward changeset's deletes must lie within `original`;
+                    // a violation means `original` is not the pre-image (a caller
+                    // bug). Surface it loudly in debug rather than silently
+                    // dropping the recovered text (which would break undo), while
+                    // the `if` keeps release builds panic-free.
+                    debug_assert!(
+                        end <= original.len_bytes(),
+                        "invert: Delete extent {end} exceeds original length {}",
+                        original.len_bytes()
+                    );
                     if end <= original.len_bytes() {
                         let start_char = original.byte_to_char(byte_pos);
                         let end_char = original.byte_to_char(end);

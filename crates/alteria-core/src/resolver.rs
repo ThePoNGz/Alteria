@@ -133,7 +133,10 @@ impl Resolver {
             if let Key::Char(c) = key {
                 if let Some(d) = c.to_digit(10) {
                     if d != 0 || self.count > 0 {
-                        self.count = self.count * 10 + d as usize;
+                        // Saturate: a held/auto-repeated digit must never overflow
+                        // usize (which panics in debug builds). A clamped count
+                        // just drives a motion that stops at the buffer edge.
+                        self.count = self.count.saturating_mul(10).saturating_add(d as usize);
                         return None;
                     }
                 }
@@ -408,6 +411,26 @@ mod tests {
         assert_eq!(
             r.resolve(down(Key::Char('w'), ALT), &k),
             mv(Motion::Char(Direction::Up), false, 1)
+        );
+    }
+
+    #[test]
+    fn a_long_digit_run_saturates_instead_of_overflowing() {
+        // A held/auto-repeated digit feeds many Alt+digit events. The count must
+        // clamp instead of overflowing usize (which panics in debug builds — an
+        // input-reachable panic violates the no-panic rule).
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(ALT), &k);
+        for _ in 0..40 {
+            assert_eq!(r.resolve(down(Key::Char('9'), ALT), &k), None);
+        }
+        // It saturated rather than wrapping to a small/garbage value or panicking.
+        assert_eq!(r.pending_count(), usize::MAX);
+        // The clamped count still drives a motion that simply stops at the edge.
+        assert_eq!(
+            r.resolve(down(Key::Char('d'), ALT), &k),
+            mv(Motion::Char(Direction::Right), false, usize::MAX)
         );
     }
 

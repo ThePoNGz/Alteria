@@ -47,16 +47,27 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
 // Edits — every text change flows through a ChangeSet committed to history.
 // ---------------------------------------------------------------------------
 
-/// Insert `s` at every cursor's head, advance past it, and collapse.
+/// Typing inserts `s` at every bare cursor and **replaces** every selected span
+/// (`KEYMAP.md`: "insert `c` at every cursor's head, advance, collapse", and a
+/// selection is "replaced"). Each resulting cursor lands just past the inserted
+/// text, regardless of the selection's orientation.
 fn insert_text(buffer: &mut Buffer, history: &mut History, s: &str) {
-    let mut heads = head_points(buffer);
-    let changes: Vec<(usize, usize, String)> =
-        heads.drain(..).map(|p| (p, p, s.to_string())).collect();
-    apply_edit(buffer, history, changes);
+    let changes: Vec<(usize, usize, String)> = buffer
+        .selection
+        .ranges
+        .iter()
+        .map(|r| (r.min(), r.max(), s.to_string()))
+        .collect();
+    // Follow each range's span end so the caret lands past the inserted text
+    // even for a backward selection (where `head` is the span's left edge).
+    let targets: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.max()).collect();
+    apply_edit(buffer, history, changes, targets);
 }
 
 /// Delete the char before every cursor's head (cursors at the start contribute
-/// nothing; if none can delete, it is a no-op).
+/// nothing; if none can delete, it is a no-op). Per `KEYMAP.md`'s Base layer,
+/// `Backspace` deletes the grapheme before `head` (M0: one char) — typing, not
+/// backspace, is the path that replaces a selected span.
 fn delete_backward(buffer: &mut Buffer, history: &mut History) {
     let mut changes = Vec::new();
     for head in head_points(buffer) {
@@ -70,7 +81,8 @@ fn delete_backward(buffer: &mut Buffer, history: &mut History) {
     if changes.is_empty() {
         return;
     }
-    apply_edit(buffer, history, changes);
+    let targets: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.head).collect();
+    apply_edit(buffer, history, changes, targets);
 }
 
 /// The distinct head offsets of the current selection, sorted ascending.
@@ -82,13 +94,16 @@ fn head_points(buffer: &Buffer) -> Vec<usize> {
 }
 
 /// Build one changeset spanning all `changes` (in old coordinates), record its
-/// inverse + selections in history, apply it once, then map every range's head
-/// into the new space and merge overlaps. Each range collapses to a cursor —
-/// `KEYMAP.md` has both typing and backspace drop any span.
+/// inverse + selections in history, apply it once, then place each resulting
+/// cursor at its mapped `target` and merge overlaps. `targets[i]` is the
+/// old-space byte position range `i` should follow (the span end for an insert,
+/// the head for a backspace); it is provided by the caller because the right
+/// landing spot differs per edit. Every range collapses to a bare cursor.
 fn apply_edit(
     buffer: &mut Buffer,
     history: &mut History,
     mut changes: Vec<(usize, usize, String)>,
+    targets: Vec<usize>,
 ) {
     changes.sort_by_key(|c| c.0);
     let before_text = buffer.text.clone();
@@ -96,13 +111,12 @@ fn apply_edit(
     let forward = ChangeSet::from_changes(before_text.len_bytes(), &changes);
     let inverse = forward.invert(&before_text);
 
-    // Map every head through the one changeset. `After` keeps a cursor past
+    // Map every target through the one changeset. `After` keeps a cursor past
     // inserted text; at a deletion's right edge it lands on the deletion start.
     let mut after = Selection {
-        ranges: selection_before
-            .ranges
+        ranges: targets
             .iter()
-            .map(|r| Range::cursor(forward.map_pos(r.head, Assoc::After)))
+            .map(|&p| Range::cursor(forward.map_pos(p, Assoc::After)))
             .collect(),
         primary: selection_before.primary,
     };
@@ -184,14 +198,28 @@ fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
     });
 }
 
-/// `Alt+F` find: move the primary caret to the next/previous occurrence of `ch`
-/// on its line, collapsing to a single cursor. No match leaves the caret put.
-/// Find is a motion, so it is not recorded in history.
+/// `Alt+F` find: move every cursor's head to the next/previous occurrence of
+/// `ch` on its own line, collapsing each to a bare cursor. A cursor with no
+/// match on its line stays put (so a single bare cursor with no match is a
+/// no-op). Like every other motion it maps over all ranges rather than dropping
+/// the secondary cursors. Find is a motion, so it is not recorded in history.
 fn find_move(buffer: &mut Buffer, ch: char, forward: bool) {
-    let head = buffer.selection.primary().head;
-    if let Some(new_head) = find::find_on_line(&buffer.text, head, ch, forward) {
-        buffer.selection = Selection::at(new_head);
-    }
+    let mut moved = Selection {
+        ranges: buffer
+            .selection
+            .ranges
+            .iter()
+            .map(
+                |r| match find::find_on_line(&buffer.text, r.head, ch, forward) {
+                    Some(new_head) => Range::cursor(new_head),
+                    None => *r,
+                },
+            )
+            .collect(),
+        primary: buffer.selection.primary,
+    };
+    moved.normalize();
+    buffer.selection = moved;
 }
 
 /// Provisional (`KEYMAP.md` "not yet specified"): add a bare cursor one line
@@ -217,7 +245,14 @@ fn spawn_cursor(buffer: &mut Buffer, dir: Direction) {
 /// Apply `motion` to a head byte-offset `count` times, stopping early if it
 /// stops making progress (clamped at an edge).
 pub fn move_head(text: &Rope, mut head: usize, motion: Motion, count: usize) -> usize {
-    for _ in 0..count.max(1) {
+    // `MatchingBracket` is an involution (jump to the partner); a repeat count
+    // would just oscillate between the two ends, so it always runs exactly once.
+    let reps = if matches!(motion, Motion::MatchingBracket) {
+        1
+    } else {
+        count.max(1)
+    };
+    for _ in 0..reps {
         let next = step(text, head, motion);
         if next == head {
             break;
@@ -254,6 +289,19 @@ fn is_word(c: char) -> bool {
 /// bounds (`< len_lines`).
 fn is_blank(text: &Rope, line_idx: usize) -> bool {
     text.line(line_idx).chars().all(|c| c.is_whitespace())
+}
+
+/// The count of navigable lines, excluding the phantom empty line ropey reports
+/// after a trailing newline. That phantom line is not a real blank line the user
+/// can land on, so blank-line leaps must not treat it as a target — otherwise
+/// the same visible text behaves differently with and without a trailing `\n`.
+fn nav_line_count(text: &Rope) -> usize {
+    let lc = text.len_chars();
+    if lc > 0 && text.char(lc - 1) == '\n' {
+        text.len_lines() - 1
+    } else {
+        text.len_lines()
+    }
 }
 
 /// Character length of a line excluding its trailing line break (`\n`/`\r\n`).
@@ -340,7 +388,7 @@ fn line_end(text: &Rope, head: usize) -> usize {
 
 fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
     let line = text.char_to_line(text.byte_to_char(head));
-    let n = text.len_lines();
+    let n = nav_line_count(text);
     let target = if up {
         let mut j = line;
         while j > 0 && is_blank(text, j) {
@@ -565,6 +613,47 @@ mod tests {
         assert_eq!(head(&b), 1);
     }
 
+    #[test]
+    fn typing_over_a_forward_span_replaces_it() {
+        // KEYMAP.md: "typing replaces it." The whole word "abc" is selected;
+        // typing 'X' must replace the span, not insert past it.
+        let mut b = span("abc", 0, 3);
+        run(&mut b, Action::InsertChar('X'));
+        assert_eq!(b.text, "X");
+        assert_eq!(b.selection.primary(), Range::cursor(1));
+    }
+
+    #[test]
+    fn typing_over_a_backward_span_replaces_it() {
+        // Orientation must not matter: "bcd" selected backward (head left of
+        // anchor) still replaces, and the caret lands past the inserted text.
+        let mut b = span("abcde", 4, 1); // anchor=4, head=1 -> span [1,4) = "bcd"
+        run(&mut b, Action::InsertChar('X'));
+        assert_eq!(b.text, "aXe");
+        assert_eq!(b.selection.primary(), Range::cursor(2)); // min(1)+len("X")
+    }
+
+    #[test]
+    fn newline_over_a_span_replaces_it() {
+        let mut b = span("abc", 0, 3);
+        run(&mut b, Action::InsertNewline);
+        assert_eq!(b.text, "\n");
+        assert_eq!(b.selection.primary(), Range::cursor(1));
+    }
+
+    #[test]
+    fn typing_over_multiple_spans_replaces_each() {
+        // "ab cd": select "ab" [0,2) and "cd" [3,5); typing 'X' replaces both.
+        let mut b = Buffer::from_str("ab cd");
+        b.selection = Selection {
+            ranges: vec![Range { anchor: 0, head: 2 }, Range { anchor: 3, head: 5 }],
+            primary: 0,
+        };
+        run(&mut b, Action::InsertChar('X'));
+        assert_eq!(b.text, "X X");
+        assert_eq!(heads(&b), vec![1, 3]);
+    }
+
     // ---- char motions ---------------------------------------------------
 
     #[test]
@@ -693,6 +782,25 @@ mod tests {
         assert_eq!(head(&b), 1);
     }
 
+    #[test]
+    fn blank_line_down_ignores_the_phantom_trailing_line() {
+        // A file ending in '\n' makes ropey report a phantom empty last line.
+        // It is not a blank line the user can see, so `]` must not jump to it —
+        // otherwise the same visible text behaves differently with/without a
+        // trailing newline.
+        let mut b = at("abc\ndef\n", 0);
+        run(&mut b, mv(BlankLine(Direction::Down), false, 1));
+        assert_eq!(head(&b), 0); // no real blank line below -> no-op
+    }
+
+    #[test]
+    fn blank_line_down_still_finds_a_real_trailing_blank_line() {
+        // "abc\n\n": line1 is a genuine blank line (then the phantom). `]` reaches it.
+        let mut b = at("abc\n\n", 0);
+        run(&mut b, mv(BlankLine(Direction::Down), false, 1));
+        assert_eq!(head(&b), 4); // start of the blank line
+    }
+
     // ---- matching bracket ----------------------------------------------
 
     #[test]
@@ -724,6 +832,18 @@ mod tests {
         let mut b = at("abc", 1);
         run(&mut b, mv(MatchingBracket, false, 1));
         assert_eq!(head(&b), 1);
+    }
+
+    #[test]
+    fn matching_bracket_ignores_repeat_count() {
+        // Jumping to a partner is an involution; a count would just oscillate
+        // between the two ends. A count must run it once, not bounce back.
+        let mut b = at("()", 0);
+        run(&mut b, mv(MatchingBracket, false, 2));
+        assert_eq!(head(&b), 1); // partner, not back to the start
+        let mut b3 = at("()", 0);
+        run(&mut b3, mv(MatchingBracket, false, 3));
+        assert_eq!(head(&b3), 1);
     }
 
     #[test]
@@ -873,6 +993,28 @@ mod tests {
         let mut h = History::new();
         apply(Action::FindChar { ch: 'z' }, &mut b, &mut h);
         assert_eq!(head(&b), 0);
+    }
+
+    #[test]
+    fn find_moves_every_cursor_and_keeps_the_multicursor() {
+        // Find is a motion; like every other motion it must move each cursor on
+        // its own line, not silently discard the secondary cursors.
+        // "axbx": a0 x1 b2 x3
+        let mut b = cursors("axbx", &[0, 2]);
+        let mut h = History::new();
+        apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
+        assert_eq!(b.selection.ranges.len(), 2);
+        assert_eq!(heads(&b), vec![1, 3]);
+    }
+
+    #[test]
+    fn find_with_no_match_for_one_cursor_leaves_that_cursor_put() {
+        // "ax\ncd": cursor on line0 finds 'x'; cursor on line1 has none -> stays.
+        // a0 x1 \n2 c3 d4
+        let mut b = cursors("ax\ncd", &[0, 3]);
+        let mut h = History::new();
+        apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
+        assert_eq!(heads(&b), vec![1, 3]);
     }
 
     // ---- expansion (wired through the executor, undoable) ---------------
