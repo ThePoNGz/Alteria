@@ -1,4 +1,6 @@
 # Workflow (parallel agents)
+Always reference this https://github.com/zed-industries/zed
+
 I sometimes will run multiple claude code instances.
 
 Three roles, one source of truth: `origin/main`.
