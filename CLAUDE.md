@@ -1,5 +1,5 @@
 # Workflow (parallel agents)
-Always reference this https://github.com/zed-industries/zed
+Always reference https://github.com/zed-industries/zed — it is the **source of truth for every logic, feature, and framework decision** (see "Zed is the source of truth — the other hard rule" below).
 
 I sometimes will run multiple claude code instances.
 
@@ -38,7 +38,6 @@ Keyboard-centric, **non-modal** code editor in Rust, built on **quasimodes** —
 - **Goal:** a daily driver for the author first; good enough that others *could* adopt it.
 - **Goal: accessible by default** — usable immediately by someone who never reads the keymap. The Alt layer is a power-up, not a prerequisite; standard editor conventions (mouse select, `Ctrl+C/V/X/Z/S`, …) work with no modifier held.
 - **Goal:** "feels instant on the files I actually open" — **not** Zed's huge-file/120fps engineering. The latency metric that matters is keystroke→paint (single-digit ms).
-- **Goal:** free & open source (GPL-3.0).
 - **Non-goal (for now):** Zed-tier rendering/perf — an eventual aspiration, but today's bar is "feels instant on my files", not 120fps/huge-file engineering. Also out of scope: collaboration, terminal/TTY support, and building for hypothetical contributors (stay modular so the door stays open at zero cost).
 
 ## Architecture — the one hard rule
@@ -78,7 +77,6 @@ The frontend does only the first translation (OS event → `InputEvent`) and the
 | Undo/redo | transaction/changeset + revision-tree history, anchor-based |
 | Syntax highlighting | tree-sitter |
 | Config / keymap file | declarative, serialized `Keymap` |
-| License | GPL-3.0-or-later |
 
 - **Pin GPUI to a specific SHA** in `crates/alteria-gpui/Cargo.toml`. Don't float the rev — bump deliberately and rebuild. The published `gpui` crate (0.2.2) is stale; use the git rev.
 - GPUI needs a **Vulkan-capable GPU**. Arch deps: `vulkan-icd-loader libxkbcommon wayland fontconfig` + your GPU's Vulkan driver (`vulkan-radeon` / `vulkan-intel` / `nvidia-utils`). Verify with `vulkaninfo | head`.
@@ -92,16 +90,24 @@ The agent's training knowledge of GPUI is thin and **stale**; the API moves week
 2. Anything that needs live API confirmation: actually verify it against your checkout — never rely on a remembered GPUI API.
 3. **Don't route quasimode logic through GPUI's Action/keymap system** — it can't express "a modifier is held with no key." Raw `on_key_down` / `on_key_up` / `on_modifiers_changed` feed the core, which owns the logic. Bare modifiers arrive via `ModifiersChangedEvent` (fires on Wayland and X11, independent of other keys) — that primitive is what the whole concept rides on.
 
-## Licensing & using Zed as a reference
+## Zed is the source of truth — the other hard rule
 
-Alteria is **GPL-3.0**. Zed's repo holds two kinds of code on opposite sides of a license line:
+There are infinitely many ways to implement any feature, and most of them are slower, buggier, or clumsier than the best one. Zed is a production editor whose every subsystem was designed and tuned by a large team of expert engineers to run fast and behave correctly. We are one person — we do **not** re-derive those decisions, we copy them. This is a private editor built for one user; there is no licensing concern, so there is nothing stopping us from taking Zed's approach wholesale.
 
-- **GPUI usage / patterns (Apache-2.0):** `gpui` (+ `gpui_*`), `sum_tree`, `collections` — copy and adapt freely. That's what GPUI is for.
-- **Zed's editor logic (GPL-3.0):** `rope`, `text`, `editor`, `language`, `multi_buffer`, `clock`, `fuzzy` — read to understand the **approach**, then write Alteria's own implementation on our crates (ropey). **Never paste Zed's editor source.**
+**Hard rule: for every logic, feature, and framework decision, Zed's source (`zed-industries/zed`) is the source of truth.** Before designing or implementing any subsystem, go find how Zed does it and do the same thing. This is not "use Zed as inspiration" — it is "Zed already solved this; reproduce their solution." It covers:
 
-The line runs between `sum_tree` (Apache) and `rope` (GPL). We use **ropey** regardless — the "feels-instant on my files" bar doesn't need SumTree-tier engineering. Ideas/algorithms/architecture aren't copyrightable; literal expression is. GPL-3.0 also cleanly clears GPUI's transitive-GPL link (a GPL binary linking GPL deps is compliant).
+- **Framework / library decisions** — which crate, which dependency, which API, which data structure Zed reaches for. If Zed picked it, that's our default pick.
+- **Feature logic** — how a feature behaves, its edge cases, how it interacts with other features. Mirror Zed's behavior.
+- **Systems logic** — buffer/rope handling, selections, undo/redo, multicursor, input dispatch, rendering, layout, caching — all of it. Read Zed's implementation, understand the approach, reproduce it.
 
-Whatever zed is doing that makes them so good, we do exactly that.
+When Alteria needs a subsystem, the default is never "design one from scratch" — it's **read Zed's, understand the approach, reproduce it on our stack.** Deviate only where Alteria's design genuinely forces it (quasimodes, the `held`-modifier resolver, the gpui-free core, ropey instead of Zed's `rope`/`sum_tree`) — and even then, match Zed everywhere the difference doesn't compel a change.
+
+**Where to look in `zed-industries/zed` (read the approach, then implement on our crates):**
+
+- **GPUI / rendering / windowing / input:** `gpui` (+ `gpui_*`), plus its data-structure crates `sum_tree`, `collections`. This is what GPUI is for — adapt freely.
+- **Editor logic:** `rope`, `text`, `editor`, `language`, `multi_buffer`, `clock`, `fuzzy`. We implement on **ropey** rather than Zed's `rope`/`sum_tree` (the "feels-instant on my files" bar doesn't need SumTree-tier engineering), but the *algorithms and architecture* should still mirror Zed's.
+
+Whatever Zed is doing that makes it so good, we do exactly that. Period.
 
 
 ## Conventions
@@ -118,7 +124,7 @@ Before ending any response that produced code, genuinely re-read what you wrote 
 
 1. **Decoupled core:** no `gpui` import anywhere in `alteria-core`; pipeline stages stay pure functions over plain data.
 2. **GPUI is current, not remembered:** every GPUI API used was checked against the pinned rev's examples / docs / Context7, not written from memory.
-3. **Licensing:** no Zed GPL editor source pasted; GPUI (Apache) patterns are fine to adapt.
+3. **Zed parity:** for any subsystem touched, you checked how Zed implements it in `zed-industries/zed` and followed that approach — framework choice, feature logic, systems logic (see "Zed is the source of truth").
 4. **Tests:** core changes have tests; `cargo test -p alteria-core` passes; new behavior driven test-first where practical.
 5. **Clean build:** `cargo fmt`, `cargo clippy`, `cargo build` clean (no warnings) before commit.
 6. **Edges handled:** buffer start/end, empty buffer, modifier release (no stuck quasimode); no `unwrap()` on input-reachable paths.
