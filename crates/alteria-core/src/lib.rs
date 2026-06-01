@@ -10,6 +10,7 @@
 
 pub mod action;
 pub mod buffer;
+pub mod char_kind;
 pub mod executor;
 pub mod expand;
 pub mod find;
