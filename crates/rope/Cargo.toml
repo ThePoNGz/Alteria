@@ -8,6 +8,18 @@ license = "GPL-3.0-or-later"
 [lib]
 path = "src/rope.rs"
 
+# Vendored-crate lint noise, silenced at the manifest so the `.rs` stays verbatim
+# (future Zed reads must line up). `rust_analyzer` is a cfg Zed sets in its own
+# workspace; we dropped that workspace, so declare it expected here. The clippy
+# entries are upstream style choices we don't rewrite.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rust_analyzer)'] }
+
+[lints.clippy]
+from_over_into = "allow"
+collapsible_else_if = "allow"
+should_implement_trait = "allow"
+
 [dependencies]
 heapless = "0.9.2"
 log = "0.4"
