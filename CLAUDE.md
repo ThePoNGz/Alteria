@@ -61,7 +61,7 @@ The frontend does only the first translation (OS event → `InputEvent`) and the
 - `keymap` — `Keymap { layers: HashMap<Modifiers, Layer> }`, `Layer { bindings: HashMap<Key, Action> }`. Held modifiers select the active layer. Declarative/remappable.
 - `resolver` — the state machine. Holds `held` mods (the only mutable input state), updated by modifier/focus events. Resolves `(held, key) → Action`.
 - `selection` — `Range { anchor, head }` + `Selection { ranges: Vec<Range>, primary }`.
-- `buffer` — ropey `Rope` + current `Selection`.
+- `buffer` — Zed's byte-indexed `rope::Rope` (vendored from `zed-industries/zed`) + current `Selection`.
 - `executor` — applies one `Action` to the `Buffer`.
 - `lib` (`Editor` facade) — ties resolver + keymap + buffer; exposes `handle(InputEvent) -> bool` (redraw?), the single entry point the frontend calls.
 
@@ -72,9 +72,9 @@ The frontend does only the first translation (OS event → `InputEvent`) and the
 | Language | Rust (edition 2021, `rustup default stable`) |
 | UI / windowing / input | GPUI — **pinned git rev** of `zed-industries/zed`, wgpu backend |
 | GPU render + text shaping/raster | handled by GPUI (cosmic-text stack) |
-| Text buffer | ropey **1.6.x** (not the 2.0 beta — it switches to byte-indexing) |
-| Coordinate model | store byte offsets; move by grapheme clusters; derive visual columns |
-| Undo/redo | transaction/changeset + revision-tree history, anchor-based |
+| Text buffer | Zed's `rope` crate (**vendored** from `zed-industries/zed`) — a **byte-indexed** `Rope` on `sum_tree`. Never a substitute text library. |
+| Coordinate model | **byte offsets** + Zed's `Point` (row, byte-column) / `PointUtf16` / `OffsetUtf16`; cross boundaries with `clip`+`Bias`; move by grapheme clusters |
+| Undo/redo | Zed's `text` model — Lamport-`clock` operation log + `UndoMap`, anchor-based (**Phase 2**, see `plans/005`). Interim: a Helix-style changeset, to be retired. |
 | Syntax highlighting | tree-sitter |
 | Config / keymap file | declarative, serialized `Keymap` |
 
@@ -100,12 +100,12 @@ There are infinitely many ways to implement any feature, and most of them are sl
 - **Feature logic** — how a feature behaves, its edge cases, how it interacts with other features. Mirror Zed's behavior.
 - **Systems logic** — buffer/rope handling, selections, undo/redo, multicursor, input dispatch, rendering, layout, caching — all of it. Read Zed's implementation, understand the approach, reproduce it.
 
-When Alteria needs a subsystem, the default is never "design one from scratch" — it's **read Zed's, understand the approach, reproduce it on our stack.** Deviate only where Alteria's design genuinely forces it (quasimodes, the `held`-modifier resolver, the gpui-free core, ropey instead of Zed's `rope`/`sum_tree`) — and even then, match Zed everywhere the difference doesn't compel a change.
+When Alteria needs a subsystem, the default is never "design one from scratch" — it's **read Zed's, understand the approach, reproduce it on our stack.** Deviate only where Alteria's design genuinely forces it (quasimodes, the `held`-modifier resolver, the gpui-free core) — and even then, match Zed everywhere the difference doesn't compel a change.
 
 **Where to look in `zed-industries/zed` (read the approach, then implement on our crates):**
 
 - **GPUI / rendering / windowing / input:** `gpui` (+ `gpui_*`), plus its data-structure crates `sum_tree`, `collections`. This is what GPUI is for — adapt freely.
-- **Editor logic:** `rope`, `text`, `editor`, `language`, `multi_buffer`, `clock`, `fuzzy`. We implement on **ropey** rather than Zed's `rope`/`sum_tree` (the "feels-instant on my files" bar doesn't need SumTree-tier engineering), but the *algorithms and architecture* should still mirror Zed's.
+- **Editor logic:** `rope`, `text`, `editor`, `language`, `multi_buffer`, `clock`, `fuzzy`. We **vendor Zed's `rope` + `sum_tree`** verbatim as the text buffer (byte-indexed) and port editor logic against it; the anchor + Lamport-`clock` operation-log undo from `text`/`clock` is Phase 2 (`plans/005`). Do **not** swap in a different text library — a non-Zed primitive is exactly what makes Zed's source impossible to reference.
 
 Whatever Zed is doing that makes it so good, we do exactly that. Period.
 

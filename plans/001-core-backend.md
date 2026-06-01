@@ -1,5 +1,7 @@
 # Plan 001 — The complete `alteria-core` backend
 
+> **⚠️ Stack update (post-execution):** this plan was executed on `ropey`. The text-buffer choice has since changed — Alteria now uses **Zed's vendored, byte-indexed `rope`** (see `CLAUDE.md` → Stack, and **`plans/002`**, the migration). Everything below that mentions `ropey`, the `byte_to_char`/`char_to_byte` bridge, or "convert at the ropey boundary" is **obsolete — read it as history**. The pipeline, keymap, resolver, selection model, and all KEYMAP behaviors are unchanged.
+
 **Goal:** Build the entire pure-Rust editing engine — the whole input→intent→action pipeline,
 every `KEYMAP.md` behavior that is pure logic, a transaction layer, revision-tree undo, and
 multicursor — test-first, ending green under `cargo test -p alteria-core`. After this plan the
@@ -11,12 +13,14 @@ This crate is governed by the project's **one hard rule**: `alteria-core` **neve
 render/perf/Zed-reference work lives entirely in the *frontend* (`alteria-gpui`) and is plan
 002+. This plan is plain data + pure functions only.
 
-> **Sources of truth (do not contradict):** `../CLAUDE.md` (architecture, the one hard rule,
-> conventions, the parallel-agent workflow), `../KEYMAP.md` (the exact behavior of every
-> binding — the behavioral spec this plan implements), `../DESIGN.md` (locked decisions:
-> undo = transaction/changeset + revision-tree history, anchor-based; byte-offset coordinates,
-> char movement for M0; multicursor = `Vec<Range>`, one edit applies to all). This plan does
-> not restate the keymap — read `KEYMAP.md` for each binding and implement it.
+> **Sources of truth (do not contradict):** `../CLAUDE.md` (architecture, the two hard rules,
+> conventions, the parallel-agent workflow) and `../KEYMAP.md` (the exact behavior of every
+> binding — the behavioral spec this plan implements). `CLAUDE.md` is explicit that context
+> lives in those two files only; the old `DESIGN.md` is gone. Locked decisions still in force:
+> **byte-offset coordinates**; multicursor = `Vec<Range>`, one edit applies to all; char
+> movement for M0 (grapheme later). The undo model is migrating to Zed's `text`/`clock` (anchor
+> + operation log) — see `plans/002`. This plan does not restate the keymap — read `KEYMAP.md`
+> for each binding and implement it.
 
 ---
 
@@ -90,10 +94,11 @@ crates/alteria-core/src/history.rs
   `InsertChar` produces a `ChangeSet` applied once — never mutate the rope ad-hoc. This is what
   makes undo and multicursor fall out naturally instead of being retrofits. Do **not** take the
   M0 shortcut of mutating the rope directly.
-- **Coordinate convention:** `Range` stores **byte offsets**; the `ChangeSet` also operates in
-  **byte offsets**, at `char` boundaries (M0 edits at char boundaries, so byte alignment
-  holds). Convert to ropey's char indices only at the ropey API boundary
-  (`text.byte_to_char(b)`). One coordinate space across selection + transaction.
+- **Coordinate convention:** `Range` and the `ChangeSet` both operate in **UTF-8 byte offsets**
+  — one coordinate space across selection + transaction. *(Superseded by `plans/002`: on Zed's
+  byte-indexed `rope` there is **no** char-index boundary to convert at; the old
+  `text.byte_to_char(b)` bridge is deleted, offsets stay byte offsets end to end, and boundaries
+  are handled with `rope`'s `is_char_boundary` / `clip_offset` + `Bias`.)*
 - **The one hard rule:** no `gpui` in the dep tree at all. Keep it that way.
 
 ---
@@ -123,7 +128,8 @@ crates/alteria-core/src/history.rs
 **Files:** `Cargo.toml`, `crates/alteria-core/Cargo.toml`, `crates/alteria-core/src/lib.rs`
 - Root `Cargo.toml`: `[workspace]`, `resolver = "2"`, `members = ["crates/alteria-core"]`.
 - Crate `Cargo.toml`: `name = "alteria-core"`, `version = "0.0.0"`, `edition = "2021"`,
-  `license = "GPL-3.0-or-later"`, `[dependencies] ropey = "1.6"`.
+  `[dependencies] ropey = "1.6"`. *(Superseded — `plans/002` replaces `ropey` with the vendored
+  `rope` crate; do not add `ropey` in new work.)*
 - `src/lib.rs`: empty (modules added per task).
 - **Verify:** `cargo build` green. **Commit:** `chore: scaffold cargo workspace (alteria-core)`.
 
