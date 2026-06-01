@@ -1,0 +1,1724 @@
+mod chunk;
+mod offset_utf16;
+mod point;
+mod point_utf16;
+mod unclipped;
+
+use heapless::Vec as ArrayVec;
+use rayon::iter::{IntoParallelIterator, ParallelIterator as _};
+use std::{
+    cmp, fmt, io, mem,
+    ops::{self, AddAssign, Range},
+    str,
+};
+use sum_tree::{Bias, Dimension, Dimensions, SumTree};
+
+pub use chunk::{Chunk, ChunkSlice};
+pub use offset_utf16::OffsetUtf16;
+pub use point::Point;
+pub use point_utf16::PointUtf16;
+pub use unclipped::Unclipped;
+
+use crate::chunk::Bitmap;
+
+#[derive(Clone, Default)]
+pub struct Rope {
+    chunks: SumTree<Chunk>,
+}
+
+impl Rope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks that `index`-th byte is the first byte in a UTF-8 code point
+    /// sequence or the end of the string.
+    ///
+    /// The start and end of the string (when `index == self.len()`) are
+    /// considered to be boundaries.
+    ///
+    /// Returns `false` if `index` is greater than `self.len()`.
+    pub fn is_char_boundary(&self, offset: usize) -> bool {
+        if self.chunks.is_empty() {
+            return offset == 0;
+        }
+        let (start, _, item) = self.chunks.find::<usize, _>((), &offset, Bias::Left);
+        let chunk_offset = offset - start;
+        item.map(|chunk| chunk.is_char_boundary(chunk_offset))
+            .unwrap_or(false)
+    }
+
+    #[track_caller]
+    #[inline(always)]
+    pub fn assert_char_boundary<const PANIC: bool>(&self, offset: usize) -> bool {
+        if self.chunks.is_empty() && offset == 0 {
+            return true;
+        }
+        let (start, _, item) = self.chunks.find::<usize, _>((), &offset, Bias::Left);
+        match item {
+            Some(chunk) => {
+                let chunk_offset = offset - start;
+                chunk.assert_char_boundary::<PANIC>(chunk_offset)
+            }
+            None if PANIC => {
+                panic!(
+                    "byte index {} is out of bounds of rope (length: {})",
+                    offset,
+                    self.len()
+                );
+            }
+            None => {
+                log::error!(
+                    "byte index {} is out of bounds of rope (length: {})",
+                    offset,
+                    self.len()
+                );
+                false
+            }
+        }
+    }
+
+    pub fn floor_char_boundary(&self, index: usize) -> usize {
+        if index >= self.len() {
+            self.len()
+        } else {
+            let (start, _, item) = self.chunks.find::<usize, _>((), &index, Bias::Left);
+            let chunk_offset = index - start;
+            let lower_idx = item.map(|chunk| chunk.text.floor_char_boundary(chunk_offset));
+            lower_idx.map_or_else(|| self.len(), |idx| start + idx)
+        }
+    }
+
+    pub fn ceil_char_boundary(&self, index: usize) -> usize {
+        if index > self.len() {
+            self.len()
+        } else {
+            let (start, _, item) = self.chunks.find::<usize, _>((), &index, Bias::Left);
+            let chunk_offset = index - start;
+            let upper_idx = item.map(|chunk| chunk.text.ceil_char_boundary(chunk_offset));
+            upper_idx.map_or_else(|| self.len(), |idx| start + idx)
+        }
+    }
+
+    pub fn append(&mut self, rope: Rope) {
+        if let Some(chunk) = rope.chunks.first()
+            && (self
+                .chunks
+                .last()
+                .is_some_and(|c| c.text.len() < chunk::MIN_BASE)
+                || chunk.text.len() < chunk::MIN_BASE)
+        {
+            self.push_chunk(chunk.as_slice());
+
+            let mut chunks = rope.chunks.cursor::<()>(());
+            chunks.next();
+            chunks.next();
+            self.chunks.append(chunks.suffix(), ());
+        } else {
+            self.chunks.append(rope.chunks, ());
+        }
+        self.check_invariants();
+    }
+
+    pub fn replace(&mut self, range: Range<usize>, text: &str) {
+        let mut new_rope = Rope::new();
+        let mut cursor = self.cursor(0);
+        new_rope.append(cursor.slice(range.start));
+        cursor.seek_forward(range.end);
+        new_rope.push(text);
+        new_rope.append(cursor.suffix());
+        *self = new_rope;
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Rope {
+        let mut cursor = self.cursor(0);
+        cursor.seek_forward(range.start);
+        cursor.slice(range.end)
+    }
+
+    pub fn slice_rows(&self, range: Range<u32>) -> Rope {
+        // This would be more efficient with a forward advance after the first, but it's fine.
+        let start = self.point_to_offset(Point::new(range.start, 0));
+        let end = self.point_to_offset(Point::new(range.end, 0));
+        self.slice(start..end)
+    }
+
+    pub fn push(&mut self, mut text: &str) {
+        self.chunks.update_last(
+            |last_chunk| {
+                let split_ix = if last_chunk.text.len() + text.len() <= chunk::MAX_BASE {
+                    text.len()
+                } else {
+                    let mut split_ix = cmp::min(
+                        chunk::MIN_BASE.saturating_sub(last_chunk.text.len()),
+                        text.len(),
+                    );
+                    while !text.is_char_boundary(split_ix) {
+                        split_ix += 1;
+                    }
+                    split_ix
+                };
+
+                let (suffix, remainder) = text.split_at(split_ix);
+                last_chunk.push_str(suffix);
+                text = remainder;
+            },
+            (),
+        );
+
+        if text.is_empty() {
+            self.check_invariants();
+            return;
+        }
+
+        #[cfg(all(test, not(rust_analyzer)))]
+        const NUM_CHUNKS: usize = 16;
+        #[cfg(not(all(test, not(rust_analyzer))))]
+        const NUM_CHUNKS: usize = 4;
+
+        // We accommodate for NUM_CHUNKS chunks of size MAX_BASE
+        // but given the chunk boundary can land within a character
+        // we need to accommodate for the worst case where every chunk gets cut short by up to 4 bytes
+        if text.len() > NUM_CHUNKS * chunk::MAX_BASE - NUM_CHUNKS * 4 {
+            return self.push_large(text);
+        }
+        // 16 is enough as otherwise we will hit the branch above
+        let mut new_chunks = ArrayVec::<_, NUM_CHUNKS, u8>::new();
+
+        while !text.is_empty() {
+            let mut split_ix = cmp::min(chunk::MAX_BASE, text.len());
+            while !text.is_char_boundary(split_ix) {
+                split_ix -= 1;
+            }
+            let (chunk, remainder) = text.split_at(split_ix);
+            new_chunks.push(chunk).unwrap();
+            text = remainder;
+        }
+        self.chunks
+            .extend(new_chunks.into_iter().map(Chunk::new), ());
+
+        self.check_invariants();
+    }
+
+    /// A copy of `push` specialized for working with large quantities of text.
+    fn push_large(&mut self, mut text: &str) {
+        // To avoid frequent reallocs when loading large swaths of file contents,
+        // we estimate worst-case `new_chunks` capacity;
+        // Chunk is a fixed-capacity buffer. If a character falls on
+        // chunk boundary, we push it off to the following chunk (thus leaving a small bit of capacity unfilled in current chunk).
+        // Worst-case chunk count when loading a file is then a case where every chunk ends up with that unused capacity.
+        // Since we're working with UTF-8, each character is at most 4 bytes wide. It follows then that the worst case is where
+        // a chunk ends with 3 bytes of a 4-byte character. These 3 bytes end up being stored in the following chunk, thus wasting
+        // 3 bytes of storage in current chunk.
+        // For example, a 1024-byte string can occupy between 32 (full ASCII, 1024/32) and 36 (full 4-byte UTF-8, 1024 / 29 rounded up) chunks.
+        const MIN_CHUNK_SIZE: usize = chunk::MAX_BASE - 3;
+
+        // We also round up the capacity up by one, for a good measure; we *really* don't want to realloc here, as we assume that the # of characters
+        // we're working with there is large.
+        let capacity = text.len().div_ceil(MIN_CHUNK_SIZE);
+        let mut new_chunks = Vec::with_capacity(capacity);
+
+        while !text.is_empty() {
+            let mut split_ix = cmp::min(chunk::MAX_BASE, text.len());
+            while !text.is_char_boundary(split_ix) {
+                split_ix -= 1;
+            }
+            let (chunk, remainder) = text.split_at(split_ix);
+            new_chunks.push(chunk);
+            text = remainder;
+        }
+
+        #[cfg(all(test, not(rust_analyzer)))]
+        const PARALLEL_THRESHOLD: usize = 4;
+        #[cfg(not(all(test, not(rust_analyzer))))]
+        const PARALLEL_THRESHOLD: usize = 84 * (2 * sum_tree::TREE_BASE);
+
+        if new_chunks.len() >= PARALLEL_THRESHOLD {
+            self.chunks
+                .par_extend(new_chunks.into_par_iter().map(Chunk::new), ());
+        } else {
+            self.chunks
+                .extend(new_chunks.into_iter().map(Chunk::new), ());
+        }
+
+        self.check_invariants();
+    }
+
+    fn push_chunk(&mut self, mut chunk: ChunkSlice) {
+        self.chunks.update_last(
+            |last_chunk| {
+                let split_ix = if last_chunk.text.len() + chunk.len() <= chunk::MAX_BASE {
+                    chunk.len()
+                } else {
+                    let mut split_ix = cmp::min(
+                        chunk::MIN_BASE.saturating_sub(last_chunk.text.len()),
+                        chunk.len(),
+                    );
+                    while !chunk.is_char_boundary(split_ix) {
+                        split_ix += 1;
+                    }
+                    split_ix
+                };
+
+                let (suffix, remainder) = chunk.split_at(split_ix);
+                last_chunk.append(suffix);
+                chunk = remainder;
+            },
+            (),
+        );
+
+        if !chunk.is_empty() {
+            self.chunks.push(chunk.into(), ());
+        }
+    }
+
+    pub fn push_front(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            self.push(text);
+            return;
+        }
+        if self
+            .chunks
+            .first()
+            .is_some_and(|c| c.text.len() + text.len() <= chunk::MAX_BASE)
+        {
+            self.chunks
+                .update_first(|first_chunk| first_chunk.prepend_str(text), ());
+            self.check_invariants();
+            return;
+        }
+        let suffix = mem::replace(self, Rope::from(text));
+        self.append(suffix);
+    }
+
+    fn check_invariants(&self) {
+        #[cfg(test)]
+        {
+            // Ensure all chunks except maybe the last one are not underflowing.
+            // Allow some wiggle room for multibyte characters at chunk boundaries.
+            let mut chunks = self.chunks.cursor::<()>(()).peekable();
+            while let Some(chunk) = chunks.next() {
+                if chunks.peek().is_some() {
+                    assert!(chunk.text.len() + 3 >= chunk::MIN_BASE);
+                }
+            }
+        }
+    }
+
+    pub fn summary(&self) -> TextSummary {
+        self.chunks.summary().text
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.extent(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn max_point(&self) -> Point {
+        self.chunks.extent(())
+    }
+
+    pub fn max_point_utf16(&self) -> PointUtf16 {
+        self.chunks.extent(())
+    }
+
+    pub fn cursor(&self, offset: usize) -> Cursor<'_> {
+        Cursor::new(self, offset)
+    }
+
+    pub fn chars(&self) -> impl Iterator<Item = char> + '_ {
+        self.chars_at(0)
+    }
+
+    pub fn chars_at(&self, start: usize) -> impl Iterator<Item = char> + '_ {
+        self.chunks_in_range(start..self.len()).flat_map(str::chars)
+    }
+
+    pub fn reversed_chars_at(&self, start: usize) -> impl Iterator<Item = char> + '_ {
+        self.reversed_chunks_in_range(0..start)
+            .flat_map(|chunk| chunk.chars().rev())
+    }
+
+    pub fn bytes_in_range(&self, range: Range<usize>) -> Bytes<'_> {
+        Bytes::new(self, range, false)
+    }
+
+    pub fn reversed_bytes_in_range(&self, range: Range<usize>) -> Bytes<'_> {
+        Bytes::new(self, range, true)
+    }
+
+    pub fn chunks(&self) -> Chunks<'_> {
+        self.chunks_in_range(0..self.len())
+    }
+
+    pub fn chunks_in_range(&self, range: Range<usize>) -> Chunks<'_> {
+        Chunks::new(self, range, false)
+    }
+
+    pub fn reversed_chunks_in_range(&self, range: Range<usize>) -> Chunks<'_> {
+        Chunks::new(self, range, true)
+    }
+
+    pub fn offset_to_offset_utf16(&self, offset: usize) -> OffsetUtf16 {
+        if offset >= self.summary().len {
+            return self.summary().len_utf16;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<usize, OffsetUtf16>, _>((), &offset, Bias::Left);
+        let overshoot = offset - start.0;
+        start.1
+            + item.map_or(Default::default(), |chunk| {
+                chunk.as_slice().offset_to_offset_utf16(overshoot)
+            })
+    }
+
+    pub fn offset_utf16_to_offset(&self, offset: OffsetUtf16) -> usize {
+        if offset >= self.summary().len_utf16 {
+            return self.summary().len;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<OffsetUtf16, usize>, _>((), &offset, Bias::Left);
+        let overshoot = offset - start.0;
+        start.1
+            + item.map_or(Default::default(), |chunk| {
+                chunk.as_slice().offset_utf16_to_offset(overshoot)
+            })
+    }
+
+    pub fn offset_to_point(&self, offset: usize) -> Point {
+        if offset >= self.summary().len {
+            return self.summary().lines;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<usize, Point>, _>((), &offset, Bias::Left);
+        let overshoot = offset - start.0;
+        start.1
+            + item.map_or(Point::zero(), |chunk| {
+                chunk.as_slice().offset_to_point(overshoot)
+            })
+    }
+
+    pub fn offset_to_point_utf16(&self, offset: usize) -> PointUtf16 {
+        if offset >= self.summary().len {
+            return self.summary().lines_utf16();
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<usize, PointUtf16>, _>((), &offset, Bias::Left);
+        let overshoot = offset - start.0;
+        start.1
+            + item.map_or(PointUtf16::zero(), |chunk| {
+                chunk.as_slice().offset_to_point_utf16(overshoot)
+            })
+    }
+
+    pub fn point_to_point_utf16(&self, point: Point) -> PointUtf16 {
+        if point >= self.summary().lines {
+            return self.summary().lines_utf16();
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<Point, PointUtf16>, _>((), &point, Bias::Left);
+        let overshoot = point - start.0;
+        start.1
+            + item.map_or(PointUtf16::zero(), |chunk| {
+                chunk.as_slice().point_to_point_utf16(overshoot)
+            })
+    }
+
+    pub fn point_utf16_to_point(&self, point: PointUtf16) -> Point {
+        if point >= self.summary().lines_utf16() {
+            return self.summary().lines;
+        }
+        let mut cursor = self.chunks.cursor::<Dimensions<PointUtf16, Point>>(());
+        cursor.seek(&point, Bias::Left);
+        let overshoot = point - cursor.start().0;
+        cursor.start().1
+            + cursor.item().map_or(Point::zero(), |chunk| {
+                chunk
+                    .as_slice()
+                    .offset_to_point(chunk.as_slice().point_utf16_to_offset(overshoot, false))
+            })
+    }
+
+    pub fn point_to_offset(&self, point: Point) -> usize {
+        if point >= self.summary().lines {
+            return self.summary().len;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<Point, usize>, _>((), &point, Bias::Left);
+        let overshoot = point - start.0;
+        start.1 + item.map_or(0, |chunk| chunk.as_slice().point_to_offset(overshoot))
+    }
+
+    pub fn point_to_offset_utf16(&self, point: Point) -> OffsetUtf16 {
+        if point >= self.summary().lines {
+            return self.summary().len_utf16;
+        }
+        let mut cursor = self.chunks.cursor::<Dimensions<Point, OffsetUtf16>>(());
+        cursor.seek(&point, Bias::Left);
+        let overshoot = point - cursor.start().0;
+        cursor.start().1
+            + cursor.item().map_or(OffsetUtf16(0), |chunk| {
+                chunk.as_slice().point_to_offset_utf16(overshoot)
+            })
+    }
+
+    pub fn point_utf16_to_offset(&self, point: PointUtf16) -> usize {
+        self.point_utf16_to_offset_impl(point, false)
+    }
+
+    pub fn point_utf16_to_offset_utf16(&self, point: PointUtf16) -> OffsetUtf16 {
+        self.point_utf16_to_offset_utf16_impl(point, false)
+    }
+
+    pub fn unclipped_point_utf16_to_offset(&self, point: Unclipped<PointUtf16>) -> usize {
+        self.point_utf16_to_offset_impl(point.0, true)
+    }
+
+    fn point_utf16_to_offset_impl(&self, point: PointUtf16, clip: bool) -> usize {
+        if point >= self.summary().lines_utf16() {
+            return self.summary().len;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<PointUtf16, usize>, _>((), &point, Bias::Left);
+        let overshoot = point - start.0;
+        start.1
+            + item.map_or(0, |chunk| {
+                chunk.as_slice().point_utf16_to_offset(overshoot, clip)
+            })
+    }
+
+    fn point_utf16_to_offset_utf16_impl(&self, point: PointUtf16, clip: bool) -> OffsetUtf16 {
+        if point >= self.summary().lines_utf16() {
+            return self.summary().len_utf16;
+        }
+        let mut cursor = self
+            .chunks
+            .cursor::<Dimensions<PointUtf16, OffsetUtf16>>(());
+        cursor.seek(&point, Bias::Left);
+        let overshoot = point - cursor.start().0;
+        cursor.start().1
+            + cursor.item().map_or(OffsetUtf16(0), |chunk| {
+                chunk
+                    .as_slice()
+                    .offset_to_offset_utf16(chunk.as_slice().point_utf16_to_offset(overshoot, clip))
+            })
+    }
+
+    pub fn unclipped_point_utf16_to_point(&self, point: Unclipped<PointUtf16>) -> Point {
+        if point.0 >= self.summary().lines_utf16() {
+            return self.summary().lines;
+        }
+        let (start, _, item) =
+            self.chunks
+                .find::<Dimensions<PointUtf16, Point>, _>((), &point.0, Bias::Left);
+        let overshoot = Unclipped(point.0 - start.0);
+        start.1
+            + item.map_or(Point::zero(), |chunk| {
+                chunk.as_slice().unclipped_point_utf16_to_point(overshoot)
+            })
+    }
+
+    pub fn clip_offset(&self, offset: usize, bias: Bias) -> usize {
+        match bias {
+            Bias::Left => self.floor_char_boundary(offset),
+            Bias::Right => self.ceil_char_boundary(offset),
+        }
+    }
+
+    pub fn clip_offset_utf16(&self, offset: OffsetUtf16, bias: Bias) -> OffsetUtf16 {
+        let (start, _, item) = self.chunks.find::<OffsetUtf16, _>((), &offset, Bias::Right);
+        if let Some(chunk) = item {
+            let overshoot = offset - start;
+            start + chunk.as_slice().clip_offset_utf16(overshoot, bias)
+        } else {
+            self.summary().len_utf16
+        }
+    }
+
+    pub fn clip_point(&self, point: Point, bias: Bias) -> Point {
+        let (start, _, item) = self.chunks.find::<Point, _>((), &point, Bias::Right);
+        if let Some(chunk) = item {
+            let overshoot = point - start;
+            start + chunk.as_slice().clip_point(overshoot, bias)
+        } else {
+            self.summary().lines
+        }
+    }
+
+    pub fn clip_point_utf16(&self, point: Unclipped<PointUtf16>, bias: Bias) -> PointUtf16 {
+        let (start, _, item) = self.chunks.find::<PointUtf16, _>((), &point.0, Bias::Right);
+        if let Some(chunk) = item {
+            let overshoot = Unclipped(point.0 - start);
+            start + chunk.as_slice().clip_point_utf16(overshoot, bias)
+        } else {
+            self.summary().lines_utf16()
+        }
+    }
+
+    pub fn starts_with(&self, pattern: &str) -> bool {
+        if pattern.len() > self.len() {
+            return false;
+        }
+        let mut remaining = pattern;
+        for chunk in self.chunks_in_range(0..self.len()) {
+            let Some(chunk) = chunk.get(..remaining.len().min(chunk.len())) else {
+                return false;
+            };
+            if remaining.starts_with(chunk) {
+                remaining = &remaining[chunk.len()..];
+                if remaining.is_empty() {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+        remaining.is_empty()
+    }
+
+    pub fn ends_with(&self, pattern: &str) -> bool {
+        if pattern.len() > self.len() {
+            return false;
+        }
+        let mut remaining = pattern;
+        for chunk in self.reversed_chunks_in_range(0..self.len()) {
+            let Some(chunk) = chunk.get(chunk.len() - remaining.len().min(chunk.len())..) else {
+                return false;
+            };
+            if remaining.ends_with(chunk) {
+                remaining = &remaining[..remaining.len() - chunk.len()];
+                if remaining.is_empty() {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+        remaining.is_empty()
+    }
+
+    pub fn line_len(&self, row: u32) -> u32 {
+        self.clip_point(Point::new(row, u32::MAX), Bias::Left)
+            .column
+    }
+}
+
+impl<'a> From<&'a str> for Rope {
+    fn from(text: &'a str) -> Self {
+        let mut rope = Self::new();
+        rope.push(text);
+        rope
+    }
+}
+
+impl<'a> FromIterator<&'a str> for Rope {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
+        let mut rope = Rope::new();
+        for chunk in iter {
+            rope.push(chunk);
+        }
+        rope
+    }
+}
+
+impl From<String> for Rope {
+    #[inline(always)]
+    fn from(text: String) -> Self {
+        Rope::from(text.as_str())
+    }
+}
+
+impl From<&String> for Rope {
+    #[inline(always)]
+    fn from(text: &String) -> Self {
+        Rope::from(text.as_str())
+    }
+}
+
+impl fmt::Display for Rope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for chunk in self.chunks() {
+            write!(f, "{}", chunk)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Rope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use std::fmt::Write as _;
+
+        write!(f, "\"")?;
+        let mut format_string = String::new();
+        for chunk in self.chunks() {
+            write!(&mut format_string, "{:?}", chunk)?;
+            write!(f, "{}", &format_string[1..format_string.len() - 1])?;
+            format_string.clear();
+        }
+        write!(f, "\"")?;
+        Ok(())
+    }
+}
+
+pub struct Cursor<'a> {
+    rope: &'a Rope,
+    chunks: sum_tree::Cursor<'a, 'static, Chunk, usize>,
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    pub fn new(rope: &'a Rope, offset: usize) -> Self {
+        let mut chunks = rope.chunks.cursor(());
+        chunks.seek(&offset, Bias::Right);
+        Self {
+            rope,
+            chunks,
+            offset,
+        }
+    }
+
+    pub fn seek_forward(&mut self, end_offset: usize) {
+        assert!(
+            end_offset >= self.offset,
+            "cannot seek backward from {} to {}",
+            self.offset,
+            end_offset
+        );
+        assert!(
+            end_offset <= self.rope.len(),
+            "cannot summarize past end of rope"
+        );
+
+        self.chunks.seek_forward(&end_offset, Bias::Right);
+        self.offset = end_offset;
+    }
+
+    pub fn slice(&mut self, end_offset: usize) -> Rope {
+        assert!(
+            end_offset >= self.offset,
+            "cannot slice backward from {} to {}",
+            self.offset,
+            end_offset
+        );
+        assert!(
+            end_offset <= self.rope.len(),
+            "cannot summarize past end of rope"
+        );
+
+        let mut slice = Rope::new();
+        if let Some(start_chunk) = self.chunks.item() {
+            let start_ix = self.offset - self.chunks.start();
+            let end_ix = cmp::min(end_offset, self.chunks.end()) - self.chunks.start();
+            slice.push_chunk(start_chunk.slice(start_ix..end_ix));
+        }
+
+        if end_offset > self.chunks.end() {
+            self.chunks.next();
+            slice.append(Rope {
+                chunks: self.chunks.slice(&end_offset, Bias::Right),
+            });
+            if let Some(end_chunk) = self.chunks.item() {
+                let end_ix = end_offset - self.chunks.start();
+                slice.push_chunk(end_chunk.slice(0..end_ix));
+            }
+        }
+
+        self.offset = end_offset;
+        slice
+    }
+
+    pub fn summary<D: TextDimension>(&mut self, end_offset: usize) -> D {
+        assert!(
+            end_offset >= self.offset,
+            "cannot summarize backward from {} to {}",
+            self.offset,
+            end_offset
+        );
+        assert!(
+            end_offset <= self.rope.len(),
+            "cannot summarize past end of rope"
+        );
+
+        let mut summary = D::zero(());
+        if let Some(start_chunk) = self.chunks.item() {
+            let start_ix = self.offset - self.chunks.start();
+            let end_ix = cmp::min(end_offset, self.chunks.end()) - self.chunks.start();
+            summary.add_assign(&D::from_chunk(start_chunk.slice(start_ix..end_ix)));
+        }
+
+        if end_offset > self.chunks.end() {
+            self.chunks.next();
+            summary.add_assign(&self.chunks.summary(&end_offset, Bias::Right));
+            if let Some(end_chunk) = self.chunks.item() {
+                let end_ix = end_offset - self.chunks.start();
+                summary.add_assign(&D::from_chunk(end_chunk.slice(0..end_ix)));
+            }
+        }
+
+        self.offset = end_offset;
+        summary
+    }
+
+    pub fn suffix(mut self) -> Rope {
+        self.slice(self.rope.chunks.extent(()))
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
+pub struct ChunkBitmaps<'a> {
+    /// A slice of text up to 128 bytes in size
+    pub text: &'a str,
+    /// Bitmap of character locations in text. LSB ordered
+    pub chars: Bitmap,
+    /// Bitmap of tab locations in text. LSB ordered
+    pub tabs: Bitmap,
+    /// Bitmap of newlines location in text. LSB ordered
+    pub newlines: Bitmap,
+}
+
+#[derive(Clone)]
+pub struct Chunks<'a> {
+    chunks: sum_tree::Cursor<'a, 'static, Chunk, usize>,
+    range: Range<usize>,
+    offset: usize,
+    reversed: bool,
+}
+
+impl<'a> Chunks<'a> {
+    pub fn new(rope: &'a Rope, range: Range<usize>, reversed: bool) -> Self {
+        let mut chunks = rope.chunks.cursor(());
+        let offset = if reversed {
+            chunks.seek(&range.end, Bias::Left);
+            range.end
+        } else {
+            chunks.seek(&range.start, Bias::Right);
+            range.start
+        };
+        let chunk_offset = offset - chunks.start();
+        if let Some(chunk) = chunks.item() {
+            chunk.assert_char_boundary::<true>(chunk_offset);
+        }
+        Self {
+            chunks,
+            range,
+            offset,
+            reversed,
+        }
+    }
+
+    fn offset_is_valid(&self) -> bool {
+        if self.reversed {
+            if self.offset <= self.range.start || self.offset > self.range.end {
+                return false;
+            }
+        } else if self.offset < self.range.start || self.offset >= self.range.end {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn seek(&mut self, mut offset: usize) {
+        offset = offset.clamp(self.range.start, self.range.end);
+
+        if self.reversed {
+            if offset > self.chunks.end() {
+                self.chunks.seek_forward(&offset, Bias::Left);
+            } else if offset <= *self.chunks.start() {
+                self.chunks.seek(&offset, Bias::Left);
+            }
+        } else {
+            if offset >= self.chunks.end() {
+                self.chunks.seek_forward(&offset, Bias::Right);
+            } else if offset < *self.chunks.start() {
+                self.chunks.seek(&offset, Bias::Right);
+            }
+        };
+
+        self.offset = offset;
+    }
+
+    pub fn set_range(&mut self, range: Range<usize>) {
+        self.range = range.clone();
+        self.seek(range.start);
+    }
+
+    /// Moves this cursor to the start of the next line in the rope.
+    ///
+    /// This method advances the cursor to the beginning of the next line.
+    /// If the cursor is already at the end of the rope, this method does nothing.
+    /// Reversed chunks iterators are not currently supported and will panic.
+    ///
+    /// Returns `true` if the cursor was successfully moved to the next line start,
+    /// or `false` if the cursor was already at the end of the rope.
+    pub fn next_line(&mut self) -> bool {
+        assert!(!self.reversed);
+
+        let mut found = false;
+        if let Some(chunk) = self.peek() {
+            if let Some(newline_ix) = chunk.find('\n') {
+                self.offset += newline_ix + 1;
+                found = self.offset <= self.range.end;
+            } else {
+                self.chunks
+                    .search_forward(|summary| summary.text.lines.row > 0);
+                self.offset = *self.chunks.start();
+
+                if let Some(newline_ix) = self.peek().and_then(|chunk| chunk.find('\n')) {
+                    self.offset += newline_ix + 1;
+                    found = self.offset <= self.range.end;
+                } else {
+                    self.offset = self.chunks.end();
+                }
+            }
+
+            if self.offset == self.chunks.end() {
+                self.next();
+            }
+        }
+
+        if self.offset > self.range.end {
+            self.offset = cmp::min(self.offset, self.range.end);
+            self.chunks.seek(&self.offset, Bias::Right);
+        }
+
+        found
+    }
+
+    /// Move this cursor to the preceding position in the rope that starts a new line.
+    /// Reversed chunks iterators are not currently supported and will panic.
+    ///
+    /// If this cursor is not on the start of a line, it will be moved to the start of
+    /// its current line. Otherwise it will be moved to the start of the previous line.
+    /// It updates the cursor's position and returns true if a previous line was found,
+    /// or false if the cursor was already at the start of the rope.
+    pub fn prev_line(&mut self) -> bool {
+        assert!(!self.reversed);
+
+        let initial_offset = self.offset;
+
+        if self.offset == *self.chunks.start() {
+            self.chunks.prev();
+        }
+
+        if let Some(chunk) = self.chunks.item() {
+            let mut end_ix = self.offset - *self.chunks.start();
+            if chunk.text.as_bytes()[end_ix - 1] == b'\n' {
+                end_ix -= 1;
+            }
+
+            if let Some(newline_ix) = chunk.text[..end_ix].rfind('\n') {
+                self.offset = *self.chunks.start() + newline_ix + 1;
+                if self.offset_is_valid() {
+                    return true;
+                }
+            }
+        }
+
+        self.chunks
+            .search_backward(|summary| summary.text.lines.row > 0);
+        self.offset = *self.chunks.start();
+        if let Some(chunk) = self.chunks.item()
+            && let Some(newline_ix) = chunk.text.rfind('\n')
+        {
+            self.offset += newline_ix + 1;
+            if self.offset_is_valid() {
+                if self.offset == self.chunks.end() {
+                    self.chunks.next();
+                }
+
+                return true;
+            }
+        }
+
+        if !self.offset_is_valid() || self.chunks.item().is_none() {
+            self.offset = self.range.start;
+            self.chunks.seek(&self.offset, Bias::Right);
+        }
+
+        self.offset < initial_offset && self.offset == 0
+    }
+
+    pub fn peek(&self) -> Option<&'a str> {
+        if !self.offset_is_valid() {
+            return None;
+        }
+
+        let chunk = self.chunks.item()?;
+        let chunk_start = *self.chunks.start();
+        let slice_range = if self.reversed {
+            let slice_start = cmp::max(chunk_start, self.range.start) - chunk_start;
+            let slice_end = self.offset - chunk_start;
+            slice_start..slice_end
+        } else {
+            let slice_start = self.offset - chunk_start;
+            let slice_end = cmp::min(self.chunks.end(), self.range.end) - chunk_start;
+            slice_start..slice_end
+        };
+
+        Some(&chunk.text[slice_range])
+    }
+
+    /// Returns bitmaps that represent character positions and tab positions
+    pub fn peek_with_bitmaps(&self) -> Option<ChunkBitmaps<'a>> {
+        if !self.offset_is_valid() {
+            return None;
+        }
+
+        let chunk = self.chunks.item()?;
+        let chunk_start = *self.chunks.start();
+        let slice_range = if self.reversed {
+            let slice_start = cmp::max(chunk_start, self.range.start) - chunk_start;
+            let slice_end = self.offset - chunk_start;
+            slice_start..slice_end
+        } else {
+            let slice_start = self.offset - chunk_start;
+            let slice_end = cmp::min(self.chunks.end(), self.range.end) - chunk_start;
+            slice_start..slice_end
+        };
+        let chunk_start_offset = slice_range.start;
+        let slice_text = &chunk.text[slice_range];
+
+        // Shift the tabs to align with our slice window
+        let shifted_tabs = chunk.tabs() >> chunk_start_offset;
+        let shifted_chars = chunk.chars() >> chunk_start_offset;
+        let shifted_newlines = chunk.newlines() >> chunk_start_offset;
+
+        Some(ChunkBitmaps {
+            text: slice_text,
+            chars: shifted_chars,
+            tabs: shifted_tabs,
+            newlines: shifted_newlines,
+        })
+    }
+
+    pub fn lines(self) -> Lines<'a> {
+        let reversed = self.reversed;
+        Lines {
+            chunks: self,
+            current_line: String::new(),
+            done: false,
+            reversed,
+        }
+    }
+
+    pub fn equals_str(&self, other: &str) -> bool {
+        let chunk = self.clone();
+        if chunk.reversed {
+            let mut offset = other.len();
+            for chunk in chunk {
+                if other[0..offset].ends_with(chunk) {
+                    offset -= chunk.len();
+                } else {
+                    return false;
+                }
+            }
+            if offset != 0 {
+                return false;
+            }
+        } else {
+            let mut offset = 0;
+            for chunk in chunk {
+                if offset >= other.len() {
+                    return false;
+                }
+                if other[offset..].starts_with(chunk) {
+                    offset += chunk.len();
+                } else {
+                    return false;
+                }
+            }
+            if offset != other.len() {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+pub struct ChunkWithBitmaps<'a>(pub Chunks<'a>);
+
+impl<'a> Iterator for ChunkWithBitmaps<'a> {
+    /// text, chars bitmap, tabs bitmap
+    type Item = ChunkBitmaps<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let chunk_bitmaps = self.0.peek_with_bitmaps()?;
+        if self.0.reversed {
+            self.0.offset -= chunk_bitmaps.text.len();
+            if self.0.offset <= *self.0.chunks.start() {
+                self.0.chunks.prev();
+            }
+        } else {
+            self.0.offset += chunk_bitmaps.text.len();
+            if self.0.offset >= self.0.chunks.end() {
+                self.0.chunks.next();
+            }
+        }
+
+        Some(chunk_bitmaps)
+    }
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let chunk = self.peek()?;
+        if self.reversed {
+            self.offset -= chunk.len();
+            if self.offset <= *self.chunks.start() {
+                self.chunks.prev();
+            }
+        } else {
+            self.offset += chunk.len();
+            if self.offset >= self.chunks.end() {
+                self.chunks.next();
+            }
+        }
+
+        Some(chunk)
+    }
+}
+
+pub struct Bytes<'a> {
+    chunks: sum_tree::Cursor<'a, 'static, Chunk, usize>,
+    range: Range<usize>,
+    reversed: bool,
+}
+
+impl<'a> Bytes<'a> {
+    pub fn new(rope: &'a Rope, range: Range<usize>, reversed: bool) -> Self {
+        let mut chunks = rope.chunks.cursor(());
+        if reversed {
+            chunks.seek(&range.end, Bias::Left);
+        } else {
+            chunks.seek(&range.start, Bias::Right);
+        }
+        Self {
+            chunks,
+            range,
+            reversed,
+        }
+    }
+
+    pub fn peek(&self) -> Option<&'a [u8]> {
+        let chunk = self.chunks.item()?;
+        if self.reversed && self.range.start >= self.chunks.end() {
+            return None;
+        }
+        let chunk_start = *self.chunks.start();
+        if self.range.end <= chunk_start {
+            return None;
+        }
+        let start = self.range.start.saturating_sub(chunk_start);
+        let end = self.range.end - chunk_start;
+        Some(&chunk.text.as_bytes()[start..chunk.text.len().min(end)])
+    }
+}
+
+impl<'a> Iterator for Bytes<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.peek();
+        if result.is_some() {
+            if self.reversed {
+                self.chunks.prev();
+            } else {
+                self.chunks.next();
+            }
+        }
+        result
+    }
+}
+
+impl io::Read for Bytes<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(chunk) = self.peek() {
+            let len = cmp::min(buf.len(), chunk.len());
+            if self.reversed {
+                buf[..len].copy_from_slice(&chunk[chunk.len() - len..]);
+                buf[..len].reverse();
+                self.range.end -= len;
+            } else {
+                buf[..len].copy_from_slice(&chunk[..len]);
+                self.range.start += len;
+            }
+
+            if len == chunk.len() {
+                if self.reversed {
+                    self.chunks.prev();
+                } else {
+                    self.chunks.next();
+                }
+            }
+            Ok(len)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+pub struct Lines<'a> {
+    chunks: Chunks<'a>,
+    current_line: String,
+    done: bool,
+    reversed: bool,
+}
+
+impl<'a> Lines<'a> {
+    pub fn next(&mut self) -> Option<&str> {
+        if self.done {
+            return None;
+        }
+
+        self.current_line.clear();
+
+        while let Some(chunk) = self.chunks.peek() {
+            let chunk_lines = chunk.split('\n');
+            if self.reversed {
+                let mut chunk_lines = chunk_lines.rev().peekable();
+                if let Some(chunk_line) = chunk_lines.next() {
+                    let done = chunk_lines.peek().is_some();
+                    if done {
+                        self.chunks
+                            .seek(self.chunks.offset() - chunk_line.len() - "\n".len());
+                        if self.current_line.is_empty() {
+                            return Some(chunk_line);
+                        }
+                    }
+                    self.current_line.insert_str(0, chunk_line);
+                    if done {
+                        return Some(&self.current_line);
+                    }
+                }
+            } else {
+                let mut chunk_lines = chunk_lines.peekable();
+                if let Some(chunk_line) = chunk_lines.next() {
+                    let done = chunk_lines.peek().is_some();
+                    if done {
+                        self.chunks
+                            .seek(self.chunks.offset() + chunk_line.len() + "\n".len());
+                        if self.current_line.is_empty() {
+                            return Some(chunk_line);
+                        }
+                    }
+                    self.current_line.push_str(chunk_line);
+                    if done {
+                        return Some(&self.current_line);
+                    }
+                }
+            }
+
+            self.chunks.next();
+        }
+
+        self.done = true;
+        Some(&self.current_line)
+    }
+
+    pub fn seek(&mut self, offset: usize) {
+        self.chunks.seek(offset);
+        self.current_line.clear();
+        self.done = false;
+    }
+
+    pub fn offset(&self) -> usize {
+        self.chunks.offset()
+    }
+}
+
+impl sum_tree::Item for Chunk {
+    type Summary = ChunkSummary;
+
+    fn summary(&self, _cx: ()) -> Self::Summary {
+        ChunkSummary {
+            text: self.as_slice().text_summary(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChunkSummary {
+    text: TextSummary,
+}
+
+impl sum_tree::ContextLessSummary for ChunkSummary {
+    fn zero() -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &Self) {
+        self.text += &summary.text;
+    }
+}
+
+/// Summary of a string of text.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextSummary {
+    /// Length in bytes.
+    pub len: usize,
+    /// Length in UTF-8.
+    pub chars: usize,
+    /// Length in UTF-16 code units
+    pub len_utf16: OffsetUtf16,
+    /// A point representing the number of lines and the length of the last line.
+    ///
+    /// In other words, it marks the point after the last byte in the text, (if
+    /// EOF was a character, this would be its position).
+    pub lines: Point,
+    /// How many `char`s are in the first line
+    pub first_line_chars: u32,
+    /// How many `char`s are in the last line
+    pub last_line_chars: u32,
+    /// How many UTF-16 code units are in the last line
+    pub last_line_len_utf16: u32,
+    /// The row idx of the longest row
+    pub longest_row: u32,
+    /// How many `char`s are in the longest row
+    pub longest_row_chars: u32,
+}
+
+impl TextSummary {
+    pub fn lines_utf16(&self) -> PointUtf16 {
+        PointUtf16 {
+            row: self.lines.row,
+            column: self.last_line_len_utf16,
+        }
+    }
+
+    pub fn newline() -> Self {
+        Self {
+            len: 1,
+            chars: 1,
+            len_utf16: OffsetUtf16(1),
+            first_line_chars: 0,
+            last_line_chars: 0,
+            last_line_len_utf16: 0,
+            lines: Point::new(1, 0),
+            longest_row: 0,
+            longest_row_chars: 0,
+        }
+    }
+
+    pub fn add_newline(&mut self) {
+        self.len += 1;
+        self.len_utf16 += OffsetUtf16(self.len_utf16.0 + 1);
+        self.last_line_chars = 0;
+        self.last_line_len_utf16 = 0;
+        self.lines += Point::new(1, 0);
+    }
+}
+
+impl<'a> From<&'a str> for TextSummary {
+    fn from(text: &'a str) -> Self {
+        let mut len_utf16 = OffsetUtf16(0);
+        let mut lines = Point::new(0, 0);
+        let mut first_line_chars = 0;
+        let mut last_line_chars = 0;
+        let mut last_line_len_utf16 = 0;
+        let mut longest_row = 0;
+        let mut longest_row_chars = 0;
+        let mut chars = 0;
+        for c in text.chars() {
+            chars += 1;
+            len_utf16.0 += c.len_utf16();
+
+            if c == '\n' {
+                lines += Point::new(1, 0);
+                last_line_len_utf16 = 0;
+                last_line_chars = 0;
+            } else {
+                lines.column += c.len_utf8() as u32;
+                last_line_len_utf16 += c.len_utf16() as u32;
+                last_line_chars += 1;
+            }
+
+            if lines.row == 0 {
+                first_line_chars = last_line_chars;
+            }
+
+            if last_line_chars > longest_row_chars {
+                longest_row = lines.row;
+                longest_row_chars = last_line_chars;
+            }
+        }
+
+        TextSummary {
+            len: text.len(),
+            chars,
+            len_utf16,
+            lines,
+            first_line_chars,
+            last_line_chars,
+            last_line_len_utf16,
+            longest_row,
+            longest_row_chars,
+        }
+    }
+}
+
+impl sum_tree::ContextLessSummary for TextSummary {
+    fn zero() -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &Self) {
+        *self += summary;
+    }
+}
+
+impl ops::Add<Self> for TextSummary {
+    type Output = Self;
+
+    fn add(mut self, rhs: Self) -> Self::Output {
+        AddAssign::add_assign(&mut self, &rhs);
+        self
+    }
+}
+
+impl<'a> ops::AddAssign<&'a Self> for TextSummary {
+    fn add_assign(&mut self, other: &'a Self) {
+        let joined_chars = self.last_line_chars + other.first_line_chars;
+        if joined_chars > self.longest_row_chars {
+            self.longest_row = self.lines.row;
+            self.longest_row_chars = joined_chars;
+        }
+        if other.longest_row_chars > self.longest_row_chars {
+            self.longest_row = self.lines.row + other.longest_row;
+            self.longest_row_chars = other.longest_row_chars;
+        }
+
+        if self.lines.row == 0 {
+            self.first_line_chars += other.first_line_chars;
+        }
+
+        if other.lines.row == 0 {
+            self.last_line_chars += other.first_line_chars;
+            self.last_line_len_utf16 += other.last_line_len_utf16;
+        } else {
+            self.last_line_chars = other.last_line_chars;
+            self.last_line_len_utf16 = other.last_line_len_utf16;
+        }
+
+        self.chars += other.chars;
+        self.len += other.len;
+        self.len_utf16 += other.len_utf16;
+        self.lines += other.lines;
+    }
+}
+
+impl ops::AddAssign<Self> for TextSummary {
+    fn add_assign(&mut self, other: Self) {
+        *self += &other;
+    }
+}
+
+pub trait TextDimension:
+    'static + Clone + Copy + Default + for<'a> Dimension<'a, ChunkSummary> + std::fmt::Debug
+{
+    fn from_text_summary(summary: &TextSummary) -> Self;
+    fn from_chunk(chunk: ChunkSlice) -> Self;
+    fn add_assign(&mut self, other: &Self);
+}
+
+impl<D1: TextDimension, D2: TextDimension> TextDimension for Dimensions<D1, D2, ()> {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        Dimensions(
+            D1::from_text_summary(summary),
+            D2::from_text_summary(summary),
+            (),
+        )
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        Dimensions(D1::from_chunk(chunk), D2::from_chunk(chunk), ())
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        self.0.add_assign(&other.0);
+        self.1.add_assign(&other.1);
+    }
+}
+
+impl<'a> sum_tree::Dimension<'a, ChunkSummary> for TextSummary {
+    fn zero(_cx: ()) -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a ChunkSummary, _: ()) {
+        *self += &summary.text;
+    }
+}
+
+impl TextDimension for TextSummary {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        *summary
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        chunk.text_summary()
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        *self += other;
+    }
+}
+
+impl<'a> sum_tree::Dimension<'a, ChunkSummary> for usize {
+    fn zero(_cx: ()) -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a ChunkSummary, _: ()) {
+        *self += summary.text.len;
+    }
+}
+
+impl TextDimension for usize {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        summary.len
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        chunk.len()
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        *self += other;
+    }
+}
+
+impl<'a> sum_tree::Dimension<'a, ChunkSummary> for OffsetUtf16 {
+    fn zero(_cx: ()) -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a ChunkSummary, _: ()) {
+        *self += summary.text.len_utf16;
+    }
+}
+
+impl TextDimension for OffsetUtf16 {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        summary.len_utf16
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        chunk.len_utf16()
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        *self += other;
+    }
+}
+
+impl<'a> sum_tree::Dimension<'a, ChunkSummary> for Point {
+    fn zero(_cx: ()) -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a ChunkSummary, _: ()) {
+        *self += summary.text.lines;
+    }
+}
+
+impl TextDimension for Point {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        summary.lines
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        chunk.lines()
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        *self += other;
+    }
+}
+
+impl<'a> sum_tree::Dimension<'a, ChunkSummary> for PointUtf16 {
+    fn zero(_cx: ()) -> Self {
+        Default::default()
+    }
+
+    fn add_summary(&mut self, summary: &'a ChunkSummary, _: ()) {
+        *self += summary.text.lines_utf16();
+    }
+}
+
+impl TextDimension for PointUtf16 {
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        summary.lines_utf16()
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        PointUtf16 {
+            row: chunk.lines().row,
+            column: chunk.last_line_len_utf16(),
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        *self += other;
+    }
+}
+
+/// A pair of text dimensions in which only the first dimension is used for comparison,
+/// but both dimensions are updated during addition and subtraction.
+#[derive(Clone, Copy, Debug)]
+pub struct DimensionPair<K, V> {
+    pub key: K,
+    pub value: Option<V>,
+}
+
+impl<K: Default, V: Default> Default for DimensionPair<K, V> {
+    fn default() -> Self {
+        Self {
+            key: Default::default(),
+            value: Some(Default::default()),
+        }
+    }
+}
+
+impl<K, V> cmp::Ord for DimensionPair<K, V>
+where
+    K: cmp::Ord,
+{
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl<K, V> cmp::PartialOrd for DimensionPair<K, V>
+where
+    K: cmp::PartialOrd,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        self.key.partial_cmp(&other.key)
+    }
+}
+
+impl<K, V> cmp::PartialEq for DimensionPair<K, V>
+where
+    K: cmp::PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.key.eq(&other.key)
+    }
+}
+
+impl<R, R2, K, V> ops::Sub for DimensionPair<K, V>
+where
+    K: ops::Sub<K, Output = R>,
+    V: ops::Sub<V, Output = R2>,
+{
+    type Output = DimensionPair<R, R2>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        DimensionPair {
+            key: self.key - rhs.key,
+            value: self.value.zip(rhs.value).map(|(a, b)| a - b),
+        }
+    }
+}
+
+impl<R, R2, K, V> ops::AddAssign<DimensionPair<R, R2>> for DimensionPair<K, V>
+where
+    K: ops::AddAssign<R>,
+    V: ops::AddAssign<R2>,
+{
+    fn add_assign(&mut self, rhs: DimensionPair<R, R2>) {
+        self.key += rhs.key;
+        if let Some(value) = &mut self.value {
+            if let Some(other_value) = rhs.value {
+                *value += other_value;
+            } else {
+                self.value.take();
+            }
+        }
+    }
+}
+
+impl<D> std::ops::AddAssign<DimensionPair<Point, D>> for Point {
+    fn add_assign(&mut self, rhs: DimensionPair<Point, D>) {
+        *self += rhs.key;
+    }
+}
+
+impl<K, V> cmp::Eq for DimensionPair<K, V> where K: cmp::Eq {}
+
+impl<'a, K, V, S> sum_tree::Dimension<'a, S> for DimensionPair<K, V>
+where
+    S: sum_tree::Summary,
+    K: sum_tree::Dimension<'a, S>,
+    V: sum_tree::Dimension<'a, S>,
+{
+    fn zero(cx: S::Context<'_>) -> Self {
+        Self {
+            key: K::zero(cx),
+            value: Some(V::zero(cx)),
+        }
+    }
+
+    fn add_summary(&mut self, summary: &'a S, cx: S::Context<'_>) {
+        self.key.add_summary(summary, cx);
+        if let Some(value) = &mut self.value {
+            value.add_summary(summary, cx);
+        }
+    }
+}
+
+impl<K, V> TextDimension for DimensionPair<K, V>
+where
+    K: TextDimension,
+    V: TextDimension,
+{
+    fn add_assign(&mut self, other: &Self) {
+        self.key.add_assign(&other.key);
+        if let Some(value) = &mut self.value {
+            if let Some(other_value) = other.value.as_ref() {
+                value.add_assign(other_value);
+            } else {
+                self.value.take();
+            }
+        }
+    }
+
+    fn from_chunk(chunk: ChunkSlice) -> Self {
+        Self {
+            key: K::from_chunk(chunk),
+            value: Some(V::from_chunk(chunk)),
+        }
+    }
+
+    fn from_text_summary(summary: &TextSummary) -> Self {
+        Self {
+            key: K::from_text_summary(summary),
+            value: Some(V::from_text_summary(summary)),
+        }
+    }
+}
+

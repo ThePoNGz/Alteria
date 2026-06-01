@@ -15,10 +15,11 @@
 //! - `P` ([`Expansion::BracketAlternating`]): content, then that pair with its
 //!   delimiters, then the parent's content, then the parent pair, … out.
 //!
-//! Internally everything is in **char** coordinates; the entry point converts
-//! to/from the byte offsets that [`Range`] stores.
+//! Everything is in **byte** offsets, matching the byte-indexed [`rope::Rope`]
+//! and the byte offsets a [`Range`] stores — no char-index bridge. Positions
+//! step by char boundaries via [`next_boundary`]/[`prev_boundary`].
 
-use ropey::Rope;
+use rope::Rope;
 
 use crate::action::Expansion;
 use crate::selection::Range;
@@ -26,8 +27,8 @@ use crate::selection::Range;
 /// Expand `range` one level according to `kind`. Returns `range` unchanged when
 /// already at the outermost level (the executor treats that as a no-op).
 pub fn expand(text: &Rope, range: Range, kind: Expansion) -> Range {
-    let lo = text.byte_to_char(range.min());
-    let hi = text.byte_to_char(range.max());
+    let lo = range.min();
+    let hi = range.max();
     let (nlo, nhi) = match kind {
         Expansion::Enclosing => enclosing(text, lo, hi, false),
         Expansion::EnclosingLeft => enclosing(text, lo, hi, true),
@@ -35,8 +36,8 @@ pub fn expand(text: &Rope, range: Range, kind: Expansion) -> Range {
         Expansion::BracketAlternating => bracket_alternating(text, lo, hi),
     };
     Range {
-        anchor: text.char_to_byte(nlo),
-        head: text.char_to_byte(nhi),
+        anchor: nlo,
+        head: nhi,
     }
 }
 
@@ -59,29 +60,45 @@ fn is_bracket(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
+/// The char starting at byte offset `i`, or `None` at/after the end.
 fn char_at(text: &Rope, i: usize) -> Option<char> {
-    text.get_char(i)
+    text.chars_at(i).next()
+}
+
+/// The next char boundary after byte offset `i` (clamped to the buffer end).
+fn next_boundary(text: &Rope, i: usize) -> usize {
+    match char_at(text, i) {
+        Some(c) => i + c.len_utf8(),
+        None => i,
+    }
+}
+
+/// The previous char boundary before byte offset `i` (clamped to 0).
+fn prev_boundary(text: &Rope, i: usize) -> usize {
+    match text.reversed_chars_at(i).next() {
+        Some(c) => i - c.len_utf8(),
+        None => i,
+    }
 }
 
 /// The maximal word run touching the selection's left edge (the char at `lo`,
-/// or the char just before it), in char coordinates.
+/// or the char just before it), in byte offsets.
 fn word_span(text: &Rope, lo: usize) -> Option<(usize, usize)> {
-    let len = text.len_chars();
     let at_word = |i: usize| char_at(text, i).map(is_word).unwrap_or(false);
     let center = if at_word(lo) {
         lo
-    } else if lo > 0 && at_word(lo - 1) {
-        lo - 1
+    } else if lo > 0 && at_word(prev_boundary(text, lo)) {
+        prev_boundary(text, lo)
     } else {
         return None;
     };
     let mut ws = center;
-    while ws > 0 && at_word(ws - 1) {
-        ws -= 1;
+    while ws > 0 && at_word(prev_boundary(text, ws)) {
+        ws = prev_boundary(text, ws);
     }
-    let mut we = center + 1;
-    while we < len && at_word(we) {
-        we += 1;
+    let mut we = next_boundary(text, center);
+    while we < text.len() && at_word(we) {
+        we = next_boundary(text, we);
     }
     Some((ws, we))
 }
@@ -91,7 +108,7 @@ fn enclosing_open(text: &Rope, from: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = from;
     while i > 0 {
-        i -= 1;
+        i = prev_boundary(text, i);
         let c = char_at(text, i)?;
         if c == ')' || c == ']' || c == '}' {
             depth += 1;
@@ -109,10 +126,9 @@ fn enclosing_open(text: &Rope, from: usize) -> Option<usize> {
 fn matching_close(text: &Rope, open: usize) -> Option<usize> {
     let open_c = char_at(text, open)?;
     let close_c = close_of(open_c)?;
-    let len = text.len_chars();
     let mut depth = 0i32;
     let mut i = open;
-    while i < len {
+    while i < text.len() {
         let c = char_at(text, i)?;
         if c == open_c {
             depth += 1;
@@ -122,7 +138,7 @@ fn matching_close(text: &Rope, open: usize) -> Option<usize> {
                 return Some(i);
             }
         }
-        i += 1;
+        i = next_boundary(text, i);
     }
     None
 }
@@ -130,21 +146,20 @@ fn matching_close(text: &Rope, open: usize) -> Option<usize> {
 /// The end of the next word to the right of `from`, skipping non-word /
 /// non-bracket chars. `None` if a bracket is hit first or there is no word.
 fn next_word_end(text: &Rope, from: usize) -> Option<usize> {
-    let len = text.len_chars();
     let mut i = from;
-    while i < len {
+    while i < text.len() {
         let c = char_at(text, i)?;
         if is_bracket(c) {
             return None;
         }
         if is_word(c) {
             let mut e = i;
-            while e < len && char_at(text, e).map(is_word).unwrap_or(false) {
-                e += 1;
+            while e < text.len() && char_at(text, e).map(is_word).unwrap_or(false) {
+                e = next_boundary(text, e);
             }
             return Some(e);
         }
-        i += 1;
+        i = next_boundary(text, i);
     }
     None
 }
@@ -154,18 +169,23 @@ fn next_word_end(text: &Rope, from: usize) -> Option<usize> {
 fn prev_word_start(text: &Rope, from: usize) -> Option<usize> {
     let mut i = from;
     while i > 0 {
-        let c = char_at(text, i - 1)?;
+        let prev = prev_boundary(text, i);
+        let c = char_at(text, prev)?;
         if is_bracket(c) {
             return None;
         }
         if is_word(c) {
-            let mut s = i - 1;
-            while s > 0 && char_at(text, s - 1).map(is_word).unwrap_or(false) {
-                s -= 1;
+            let mut s = prev;
+            while s > 0
+                && char_at(text, prev_boundary(text, s))
+                    .map(is_word)
+                    .unwrap_or(false)
+            {
+                s = prev_boundary(text, s);
             }
             return Some(s);
         }
-        i -= 1;
+        i = prev;
     }
     None
 }
@@ -193,7 +213,7 @@ fn enclosing(text: &Rope, lo: usize, hi: usize, bias_left: bool) -> (usize, usiz
     // 3. Both directions blocked: the enclosing bracket pair (with delimiters).
     if let Some(op) = enclosing_open(text, lo) {
         if let Some(cl) = matching_close(text, op) {
-            return (op, cl + 1);
+            return (op, next_boundary(text, cl));
         }
     }
     (lo, hi) // outermost: no-op
@@ -210,8 +230,9 @@ fn bracket_content(text: &Rope, lo: usize, hi: usize) -> (usize, usize) {
         let Some(cl) = matching_close(text, op) else {
             return (lo, hi);
         };
-        if op + 1 < lo || cl > hi {
-            return (op + 1, cl); // strictly larger content
+        let content_start = next_boundary(text, op);
+        if content_start < lo || cl > hi {
+            return (content_start, cl); // strictly larger content
         }
         from = op; // content equals current selection: climb to the parent
     }
@@ -222,26 +243,29 @@ fn bracket_alternating(text: &Rope, lo: usize, hi: usize) -> (usize, usize) {
     // Case A: the selection is a full pair `[lo, hi)` (delimiters included).
     if hi > lo
         && char_at(text, lo).and_then(close_of).is_some()
-        && matching_close(text, lo) == Some(hi - 1)
+        && matching_close(text, lo) == Some(prev_boundary(text, hi))
     {
         if let Some(pop) = enclosing_open(text, lo) {
             if let Some(pcl) = matching_close(text, pop) {
+                let parent_content_start = next_boundary(text, pop);
                 // The parent's content; if it coincides with the current pair,
                 // skip straight to the parent pair (with delimiters).
-                if (pop + 1, pcl) != (lo, hi) {
-                    return (pop + 1, pcl);
+                if (parent_content_start, pcl) != (lo, hi) {
+                    return (parent_content_start, pcl);
                 }
-                return (pop, pcl + 1);
+                return (pop, next_boundary(text, pcl));
             }
         }
         return (lo, hi); // outermost pair: no-op
     }
     // Case B: the selection is exactly a pair's content -> add its delimiters.
     if lo > 0
-        && char_at(text, lo - 1).and_then(close_of).is_some()
-        && matching_close(text, lo - 1) == Some(hi)
+        && char_at(text, prev_boundary(text, lo))
+            .and_then(close_of)
+            .is_some()
+        && matching_close(text, prev_boundary(text, lo)) == Some(hi)
     {
-        return (lo - 1, hi + 1);
+        return (prev_boundary(text, lo), next_boundary(text, hi));
     }
     // Case C: cursor / other -> the nearest pair's content.
     bracket_content(text, lo, hi)
@@ -257,7 +281,7 @@ mod tests {
     }
     /// Expand once and return the resulting span as `(min, max)` byte offsets.
     fn ex(text: &str, range: Range, kind: Expansion) -> (usize, usize) {
-        let r = expand(&Rope::from_str(text), range, kind);
+        let r = expand(&Rope::from(text), range, kind);
         (r.min(), r.max())
     }
 

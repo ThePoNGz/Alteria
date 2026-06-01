@@ -1,19 +1,20 @@
 //! The changeset transaction layer — the spine every edit flows through.
 //!
 //! A [`ChangeSet`] is a Helix-style sequence of [`Op`]s that together partition
-//! the *old* document end-to-end. Lengths are in **bytes** (the engine stores
-//! byte offsets); edits land on `char` boundaries, so byte offsets stay aligned
-//! with ropey's char-indexed API. Three pure operations make undo and
-//! multicursor fall out naturally:
+//! the *old* document end-to-end. Lengths are in **bytes**, matching the
+//! byte-indexed [`rope::Rope`] the engine stores. Three pure operations make
+//! undo and multicursor fall out naturally:
 //!
 //! - [`ChangeSet::apply`] mutates a rope.
 //! - [`ChangeSet::invert`] produces the inverse changeset for undo.
 //! - [`ChangeSet::map_pos`] maps a byte offset through the change.
 //!
-//! ropey is char-indexed while our ops are byte-indexed, so `apply`/`invert`
-//! bridge at the ropey boundary with `byte_to_char`.
+//! With Zed's byte-indexed rope there is no char↔byte bridge: ops are bytes and
+//! the rope is bytes, so `apply` splices byte ranges directly via
+//! [`rope::Rope::replace`] and `invert` recovers deleted text with
+//! [`rope::Rope::slice`].
 
-use ropey::Rope;
+use rope::Rope;
 
 /// One change operation. Lengths are in **bytes**.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -122,30 +123,25 @@ impl ChangeSet {
     /// Apply this changeset to `text`, mutating it in place.
     ///
     /// Returns `false` and leaves `text` **untouched** if the changeset does not
-    /// match the document (wrong length) or any op boundary is not a char
-    /// boundary — it validates fully before mutating, so it never panics and
-    /// never half-applies a stale or malformed changeset.
+    /// match the document (wrong length) or any op boundary is not a UTF-8 char
+    /// boundary — it validates fully before mutating, so it never corrupts the
+    /// rope and never half-applies a stale or malformed changeset.
     pub fn apply(&self, text: &mut Rope) -> bool {
         if !self.is_applicable(text) {
             return false;
         }
-        // Validated up front, so this pass mutates all-or-nothing: every
-        // `byte_to_char` lands on an in-bounds char boundary of the live rope.
-        // `byte_pos` indexes the *live* (mutating) rope: `Retain`/`Insert`
-        // advance it; `Delete` does not (deleted content shifts left into it).
-        let mut byte_pos = 0usize;
+        // Validated up front, so this pass mutates all-or-nothing. `pos` indexes
+        // the *live* (mutating) rope in bytes: `Retain`/`Insert` advance it;
+        // `Delete` does not (the suffix shifts left into it). Each op is a
+        // byte-range splice — no char conversion.
+        let mut pos = 0usize;
         for op in &self.ops {
             match op {
-                Op::Retain(n) => byte_pos += n,
-                Op::Delete(n) => {
-                    let start_char = text.byte_to_char(byte_pos);
-                    let end_char = text.byte_to_char(byte_pos + n);
-                    text.remove(start_char..end_char);
-                }
+                Op::Retain(n) => pos += n,
+                Op::Delete(n) => text.replace(pos..pos + n, ""),
                 Op::Insert(s) => {
-                    let char_idx = text.byte_to_char(byte_pos);
-                    text.insert(char_idx, s);
-                    byte_pos += s.len();
+                    text.replace(pos..pos, s);
+                    pos += s.len();
                 }
             }
         }
@@ -156,25 +152,25 @@ impl ChangeSet {
     /// `len_before` matches the document, the ops consume exactly `len_before`
     /// bytes, and every op boundary falls on a char boundary of `text`.
     fn is_applicable(&self, text: &Rope) -> bool {
-        if text.len_bytes() != self.len_before || self.consumed() != self.len_before {
+        if text.len() != self.len_before || self.consumed() != self.len_before {
             return false;
         }
-        // `pos` walks the *original* `text`; an op boundary at `pos` corresponds
-        // to the live `byte_pos` `apply` will convert (the live suffix from
-        // `byte_pos` is the original suffix from `pos`), so validating here is
-        // equivalent to validating the live conversions.
+        // `pos` walks the *original* `text` in bytes; an op boundary at `pos`
+        // corresponds to the live byte position `apply` will splice at (the live
+        // suffix from that position is the original suffix from `pos`), so
+        // validating boundaries here is equivalent to validating the live splices.
         let mut pos = 0usize;
         for op in &self.ops {
             match op {
                 Op::Retain(n) => pos += n,
                 Op::Delete(n) => {
-                    if !byte_is_char_boundary(text, pos) || !byte_is_char_boundary(text, pos + n) {
+                    if !text.is_char_boundary(pos) || !text.is_char_boundary(pos + n) {
                         return false;
                     }
                     pos += n;
                 }
                 Op::Insert(_) => {
-                    if !byte_is_char_boundary(text, pos) {
+                    if !text.is_char_boundary(pos) {
                         return false;
                     }
                 }
@@ -207,14 +203,12 @@ impl ChangeSet {
                     // dropping the recovered text (which would break undo), while
                     // the `if` keeps release builds panic-free.
                     debug_assert!(
-                        end <= original.len_bytes(),
+                        end <= original.len(),
                         "invert: Delete extent {end} exceeds original length {}",
-                        original.len_bytes()
+                        original.len()
                     );
-                    if end <= original.len_bytes() {
-                        let start_char = original.byte_to_char(byte_pos);
-                        let end_char = original.byte_to_char(end);
-                        push_insert(&mut ops, original.slice(start_char..end_char).to_string());
+                    if end <= original.len() {
+                        push_insert(&mut ops, original.slice(byte_pos..end).to_string());
                     }
                     byte_pos += n;
                 }
@@ -269,16 +263,6 @@ impl ChangeSet {
     }
 }
 
-/// True when byte offset `b` is in bounds and on a char boundary of `text`.
-///
-/// ropey 1.6 exposes no public `is_char_boundary`, and `byte_to_char` *rounds* a
-/// mid-codepoint byte down to its containing char (it does not panic), so a
-/// round-trip back to bytes reveals whether `b` was a real boundary: a
-/// mid-codepoint `b` round-trips to its char's start byte, which differs.
-fn byte_is_char_boundary(text: &Rope, b: usize) -> bool {
-    b <= text.len_bytes() && text.char_to_byte(text.byte_to_char(b)) == b
-}
-
 /// Append a `Retain(n)`, coalescing with a trailing `Retain`.
 fn push_retain(ops: &mut Vec<Op>, n: usize) {
     if n == 0 {
@@ -327,98 +311,98 @@ mod tests {
 
     #[test]
     fn apply_insert() {
-        let mut r = Rope::from_str("abc");
+        let mut r = Rope::from("abc");
         let cs = ChangeSet {
             ops: vec![Op::Retain(1), ins("X"), Op::Retain(2)],
             len_before: 3,
         };
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "aXbc");
+        assert_eq!(r.to_string(), "aXbc");
     }
 
     #[test]
     fn apply_delete() {
-        let mut r = Rope::from_str("abc");
+        let mut r = Rope::from("abc");
         let cs = ChangeSet {
             ops: vec![Op::Retain(1), Op::Delete(1), Op::Retain(1)],
             len_before: 3,
         };
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "ac");
+        assert_eq!(r.to_string(), "ac");
     }
 
     #[test]
     fn apply_mixed_replace() {
-        let mut r = Rope::from_str("hello");
+        let mut r = Rope::from("hello");
         // keep 'h', delete 'e', insert "XY", keep "llo"
         let cs = ChangeSet {
             ops: vec![Op::Retain(1), Op::Delete(1), ins("XY"), Op::Retain(3)],
             len_before: 5,
         };
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "hXYllo");
+        assert_eq!(r.to_string(), "hXYllo");
     }
 
     #[test]
     fn apply_at_end() {
-        let mut r = Rope::from_str("abc");
+        let mut r = Rope::from("abc");
         let cs = ChangeSet {
             ops: vec![Op::Retain(3), ins("Z")],
             len_before: 3,
         };
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "abcZ");
+        assert_eq!(r.to_string(), "abcZ");
     }
 
     #[test]
     fn apply_rejects_stale_changeset() {
-        let mut r = Rope::from_str("abc"); // 3 bytes
+        let mut r = Rope::from("abc"); // 3 bytes
         let cs = ChangeSet {
             ops: vec![Op::Retain(5)],
             len_before: 5, // does not match the 3-byte doc
         };
         assert!(!cs.apply(&mut r));
-        assert_eq!(r, "abc"); // untouched
+        assert_eq!(r.to_string(), "abc"); // untouched
     }
 
     #[test]
     fn apply_multibyte_insert_and_delete_stay_char_aligned() {
         // "aé" = a(1) + é(2) = 3 bytes
-        let mut r = Rope::from_str("aé");
+        let mut r = Rope::from("aé");
         let cs = ChangeSet {
             ops: vec![Op::Retain(1), ins("X"), Op::Retain(2)],
             len_before: 3,
         };
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "aXé");
+        assert_eq!(r.to_string(), "aXé");
 
         // delete the 2-byte 'é'
-        let mut r2 = Rope::from_str("aé");
+        let mut r2 = Rope::from("aé");
         let cs2 = ChangeSet {
             ops: vec![Op::Retain(1), Op::Delete(2)],
             len_before: 3,
         };
         assert!(cs2.apply(&mut r2));
-        assert_eq!(r2, "a");
+        assert_eq!(r2.to_string(), "a");
     }
 
     #[test]
     fn apply_identity_is_noop() {
-        let mut r = Rope::from_str("abc");
+        let mut r = Rope::from("abc");
         assert!(ChangeSet::identity(3).apply(&mut r));
-        assert_eq!(r, "abc");
+        assert_eq!(r.to_string(), "abc");
 
-        let mut empty = Rope::from_str("");
+        let mut empty = Rope::from("");
         assert!(ChangeSet::identity(0).apply(&mut empty));
-        assert_eq!(empty, "");
+        assert_eq!(empty.to_string(), "");
     }
 
     // ---- invert (round-trip) -------------------------------------------
 
     fn assert_round_trips(original: &str, ops: Vec<Op>) {
-        let pre = Rope::from_str(original);
+        let pre = Rope::from(original);
         let cs = ChangeSet {
-            len_before: pre.len_bytes(),
+            len_before: pre.len(),
             ops,
         };
         let mut post = pre.clone();
@@ -428,7 +412,7 @@ mod tests {
         assert_eq!(inverse.len_before, cs.len_after());
         let mut restored = post.clone();
         assert!(inverse.apply(&mut restored));
-        assert_eq!(restored, original);
+        assert_eq!(restored.to_string(), original);
     }
 
     #[test]
@@ -546,9 +530,9 @@ mod tests {
     #[test]
     fn from_changes_replace_applies_correctly() {
         let cs = ChangeSet::from_changes(5, &[(1, 3, "XYZ".to_string())]);
-        let mut r = Rope::from_str("abcde");
+        let mut r = Rope::from("abcde");
         assert!(cs.apply(&mut r));
-        assert_eq!(r, "aXYZde");
+        assert_eq!(r.to_string(), "aXYZde");
     }
 
     #[test]
@@ -577,13 +561,15 @@ mod tests {
     #[test]
     fn apply_rejects_a_midcodepoint_boundary_untouched() {
         // "é" is 2 bytes; an op boundary at byte 1 falls inside the codepoint.
-        let mut r = Rope::from_str("é");
+        // The rope is byte-true, so a splice there would corrupt UTF-8 — `apply`
+        // validates char boundaries up front and cleanly rejects it.
+        let mut r = Rope::from("é");
         let cs = ChangeSet {
             ops: vec![Op::Delete(1), Op::Retain(1)],
             len_before: 2,
         };
-        assert!(!cs.apply(&mut r)); // cleanly rejected, not silently rounded
-        assert_eq!(r, "é"); // untouched
+        assert!(!cs.apply(&mut r)); // cleanly rejected, never corrupts the rope
+        assert_eq!(r.to_string(), "é"); // untouched
     }
 
     #[test]

@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(e.head(), 1);
         e.release();
         assert!(e.key('x', Modifiers::NONE)); // type at the navigated spot
-        assert_eq!(e.buffer.text, "axb");
+        assert_eq!(e.buffer.text.to_string(), "axb");
         assert_eq!(e.head(), 2);
     }
 
@@ -187,7 +187,7 @@ mod tests {
         e.release();
         assert_eq!(e.buffer.selection.ranges.len(), 2);
         e.key('X', Modifiers::NONE); // type once -> both cursors get it
-        assert_eq!(e.buffer.text, "Xab\nXcd");
+        assert_eq!(e.buffer.text.to_string(), "Xab\nXcd");
     }
 
     #[test]
@@ -205,20 +205,20 @@ mod tests {
             (0, 3)
         );
         e.key('x', Modifiers::NONE); // typing replaces the selection -> "x"
-        assert_eq!(e.buffer.text, "x");
+        assert_eq!(e.buffer.text.to_string(), "x");
         assert_eq!(e.head(), 1);
 
         // Ctrl+Z undoes the edit (text + selection)...
         e.hold(CTRL);
         e.key('z', CTRL);
-        assert_eq!(e.buffer.text, "foo");
+        assert_eq!(e.buffer.text.to_string(), "foo");
         let p = e.buffer.selection.primary();
         assert_eq!((p.min(), p.max()), (0, 3)); // the expansion span is restored
 
         // ...and again undoes the expansion step (selection only).
         e.key('z', CTRL);
         e.release();
-        assert_eq!(e.buffer.text, "foo");
+        assert_eq!(e.buffer.text.to_string(), "foo");
         assert_eq!(e.buffer.selection.primary(), Range::cursor(0));
     }
 

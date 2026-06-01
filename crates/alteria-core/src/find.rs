@@ -1,46 +1,48 @@
 //! Inline char search — the `Alt+F` find sub-mode (see `KEYMAP.md`).
 //!
 //! A pure helper: from the caret `head`, find the next (or previous) occurrence
-//! of a target char **on the current line only**. Returns the byte offset, or
-//! `None` for no match — the executor then leaves the caret where it is.
+//! of a target char **on the current line only**. All offsets are **bytes** into
+//! the [`rope::Rope`]; returns the byte offset of the match, or `None` for no
+//! match — the executor then leaves the caret where it is.
 
-use ropey::Rope;
+use rope::{Point, Rope};
+
+use crate::buffer::line_content_len;
 
 /// The next (`forward`) or previous occurrence of `ch` on the line containing
 /// `head`, strictly past `head`. `None` if there is no match before the line
 /// boundary.
 pub fn find_on_line(text: &Rope, head: usize, ch: char, forward: bool) -> Option<usize> {
-    let head_char = text.byte_to_char(head);
-    let line = text.char_to_line(head_char);
-    let line_start = text.line_to_char(line);
-    let line_end = line_start + visual_line_len_chars(text, line);
+    let row = text.offset_to_point(head).row;
+    let line_start = text.point_to_offset(Point::new(row, 0));
+    let line_end = text.point_to_offset(Point::new(row, line_content_len(text, row)));
     if forward {
-        for i in (head_char + 1)..line_end {
-            if text.char(i) == ch {
-                return Some(text.char_to_byte(i));
+        // Scan chars after `head` (exclusive) up to the line's content end,
+        // tracking the byte offset of each char.
+        let mut offset = head;
+        for c in text.chars_at(head) {
+            if offset >= line_end {
+                break;
             }
+            if offset > head && c == ch {
+                return Some(offset);
+            }
+            offset += c.len_utf8();
         }
     } else {
-        for i in (line_start..head_char).rev() {
-            if text.char(i) == ch {
-                return Some(text.char_to_byte(i));
+        // Scan chars before `head` (exclusive) down to the line's start.
+        let mut offset = head;
+        for c in text.reversed_chars_at(head) {
+            offset -= c.len_utf8();
+            if offset < line_start {
+                break;
+            }
+            if c == ch {
+                return Some(offset);
             }
         }
     }
     None
-}
-
-/// Character length of a line excluding its trailing line break.
-fn visual_line_len_chars(text: &Rope, line_idx: usize) -> usize {
-    let line = text.line(line_idx);
-    let mut n = line.len_chars();
-    if n > 0 && line.char(n - 1) == '\n' {
-        n -= 1;
-        if n > 0 && line.char(n - 1) == '\r' {
-            n -= 1;
-        }
-    }
-    n
 }
 
 #[cfg(test)]
@@ -48,7 +50,7 @@ mod tests {
     use super::*;
 
     fn find(text: &str, head: usize, ch: char, forward: bool) -> Option<usize> {
-        find_on_line(&Rope::from_str(text), head, ch, forward)
+        find_on_line(&Rope::from(text), head, ch, forward)
     }
 
     #[test]

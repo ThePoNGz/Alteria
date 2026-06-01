@@ -1,0 +1,17 @@
+[package]
+name = "rope"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/rope.rs"
+
+[dependencies]
+heapless = "0.9.2"
+log = "0.4"
+rayon = "1.8"
+sum_tree = { path = "../sum_tree" }
+unicode-segmentation = "1.10"
+util = { path = "../util-shim" }

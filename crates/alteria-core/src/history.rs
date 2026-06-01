@@ -104,7 +104,7 @@ impl History {
 mod tests {
     use super::*;
     use crate::selection::Range;
-    use ropey::Rope;
+    use rope::Rope;
 
     /// Build an edit transaction the way the executor will: forward changeset,
     /// its inverse against the pre-image, and the two selections.
@@ -116,7 +116,7 @@ mod tests {
         sel_before: Selection,
         sel_after: Selection,
     ) -> Transaction {
-        let forward = ChangeSet::from_changes(before.len_bytes(), &[(from, to, ins.to_string())]);
+        let forward = ChangeSet::from_changes(before.len(), &[(from, to, ins.to_string())]);
         let inverse = forward.invert(before);
         Transaction {
             forward,
@@ -131,7 +131,7 @@ mod tests {
         let mut h = History::new();
         let mut buf = Buffer::from_str("abc");
         assert!(!h.undo(&mut buf));
-        assert_eq!(buf.text, "abc");
+        assert_eq!(buf.text.to_string(), "abc");
         assert_eq!(h.current(), 0);
     }
 
@@ -146,10 +146,10 @@ mod tests {
 
         let mut h = History::new();
         h.commit(tx);
-        assert_eq!(buf.text, "Xabc");
+        assert_eq!(buf.text.to_string(), "Xabc");
 
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text, "abc");
+        assert_eq!(buf.text.to_string(), "abc");
         assert_eq!(buf.selection, Selection::at(0));
         assert_eq!(h.current(), 0);
     }
@@ -169,11 +169,11 @@ mod tests {
         t2.forward.apply(&mut buf.text);
         h.commit(t2);
 
-        assert_eq!(buf.text, "XabY");
+        assert_eq!(buf.text.to_string(), "XabY");
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text, "Xab");
+        assert_eq!(buf.text.to_string(), "Xab");
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text, "ab");
+        assert_eq!(buf.text.to_string(), "ab");
         assert!(!h.undo(&mut buf)); // back at root
     }
 
@@ -196,7 +196,7 @@ mod tests {
         });
 
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text, "hello"); // text untouched
+        assert_eq!(buf.text.to_string(), "hello"); // text untouched
         assert_eq!(buf.selection, Selection::at(2)); // selection reverted
     }
 }

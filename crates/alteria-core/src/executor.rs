@@ -2,19 +2,20 @@
 //!
 //! Edits flow through a [`ChangeSet`] — even a single-char insert — so undo and
 //! multicursor fall out of the same machinery. Motions only move the selection
-//! and are not recorded in history. All coordinates are byte offsets; motion
-//! logic converts to ropey's char indices at the boundary and moves by `char`
-//! (M0; grapheme/column-memory refinement is later). Every motion clamps at the
-//! buffer edges and never panics.
+//! and are not recorded in history. All coordinates are **byte offsets** into
+//! the byte-indexed [`rope::Rope`]; motions move by char boundaries (M0 —
+//! grapheme/column-memory refinement is later) using rope's `Point` and
+//! `chars_at`/`reversed_chars_at`, mirroring Zed's `movement.rs`. Every motion
+//! clamps at the buffer edges and never panics.
 //!
 //! Multicursor: one edit builds a single [`ChangeSet`] over every range in the
 //! old coordinate space, applies it once, then maps every range into the new
 //! space and merges overlaps — so one keystroke edits all cursors atomically.
 
-use ropey::Rope;
+use rope::{Point, Rope};
 
 use crate::action::{Action, Direction, Expansion, Motion};
-use crate::buffer::Buffer;
+use crate::buffer::{line_content_len, nav_line_count, Buffer};
 use crate::expand;
 use crate::find;
 use crate::history::{History, Transaction};
@@ -75,11 +76,11 @@ fn delete_backward(buffer: &mut Buffer, history: &mut History) {
     for r in &buffer.selection.ranges {
         if r.is_empty() {
             let head = r.head;
-            let head_char = buffer.text.byte_to_char(head);
-            if head_char == 0 {
+            if head == 0 {
                 targets.push(head); // at the buffer start: nothing to delete
             } else {
-                let from = buffer.text.char_to_byte(head_char - 1);
+                // Delete back to the previous char boundary (the char before head).
+                let from = prev_boundary(&buffer.text, head);
                 intervals.push((from, head));
                 targets.push(head); // map_pos lands it on the deletion start
             }
@@ -124,7 +125,7 @@ fn apply_edit(
     changes.sort_by_key(|c| c.0);
     let before_text = buffer.text.clone();
     let selection_before = buffer.selection.clone();
-    let forward = ChangeSet::from_changes(before_text.len_bytes(), &changes);
+    let forward = ChangeSet::from_changes(before_text.len(), &changes);
     let inverse = forward.invert(&before_text);
 
     // Map every target through the one changeset. `After` keeps a cursor past
@@ -205,7 +206,7 @@ fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
     after.normalize(); // a wider primary may now swallow a sibling cursor
     buffer.selection = after.clone();
 
-    let id = ChangeSet::identity(buffer.text.len_bytes());
+    let id = ChangeSet::identity(buffer.text.len());
     history.commit(Transaction {
         forward: id.clone(),
         inverse: id,
@@ -280,8 +281,8 @@ pub fn move_head(text: &Rope, mut head: usize, motion: Motion, count: usize) -> 
 
 fn step(text: &Rope, head: usize, motion: Motion) -> usize {
     match motion {
-        Motion::Char(Direction::Left) => char_horizontal(text, head, -1),
-        Motion::Char(Direction::Right) => char_horizontal(text, head, 1),
+        Motion::Char(Direction::Left) => char_horizontal(text, head, false),
+        Motion::Char(Direction::Right) => char_horizontal(text, head, true),
         Motion::Char(Direction::Up) => vertical(text, head, true),
         Motion::Char(Direction::Down) => vertical(text, head, false),
         Motion::WordStart(Direction::Right) => word_right(text, head),
@@ -301,112 +302,128 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// True when line `line_idx` is empty or all whitespace. `line_idx` must be in
-/// bounds (`< len_lines`).
-fn is_blank(text: &Rope, line_idx: usize) -> bool {
-    text.line(line_idx).chars().all(|c| c.is_whitespace())
-}
-
-/// The count of navigable lines, excluding the phantom empty line ropey reports
-/// after a trailing newline. That phantom line is not a real blank line the user
-/// can land on, so blank-line leaps must not treat it as a target — otherwise
-/// the same visible text behaves differently with and without a trailing `\n`.
-fn nav_line_count(text: &Rope) -> usize {
-    let lc = text.len_chars();
-    if lc > 0 && text.char(lc - 1) == '\n' {
-        text.len_lines() - 1
-    } else {
-        text.len_lines()
+/// The next char boundary after byte offset `i` (clamped to the buffer end).
+fn next_boundary(text: &Rope, i: usize) -> usize {
+    match text.chars_at(i).next() {
+        Some(c) => i + c.len_utf8(),
+        None => i,
     }
 }
 
-/// Character length of a line excluding its trailing line break (`\n`/`\r\n`).
-fn visual_line_len_chars(text: &Rope, line_idx: usize) -> usize {
-    let line = text.line(line_idx);
-    let mut n = line.len_chars();
-    if n > 0 && line.char(n - 1) == '\n' {
-        n -= 1;
-        if n > 0 && line.char(n - 1) == '\r' {
-            n -= 1;
-        }
+/// The previous char boundary before byte offset `i` (clamped to 0).
+fn prev_boundary(text: &Rope, i: usize) -> usize {
+    match text.reversed_chars_at(i).next() {
+        Some(c) => i - c.len_utf8(),
+        None => i,
     }
-    n
 }
 
-fn char_horizontal(text: &Rope, head: usize, dir: isize) -> usize {
-    let hc = text.byte_to_char(head);
-    if dir < 0 {
-        if hc == 0 {
-            head
-        } else {
-            text.char_to_byte(hc - 1)
-        }
-    } else if hc >= text.len_chars() {
-        head
+/// True when line `row` is empty or all whitespace. `row` must be a real line
+/// index (`<= max_point().row`). The line's content (excluding its `\n`) is
+/// scanned; a `\n`/`\r` break is itself whitespace, so this matches treating
+/// the whole line — break included — as whitespace.
+fn is_blank(text: &Rope, row: u32) -> bool {
+    let start = text.point_to_offset(Point::new(row, 0));
+    let end = text.point_to_offset(Point::new(row, text.line_len(row)));
+    text.slice(start..end).chars().all(|c| c.is_whitespace())
+}
+
+fn char_horizontal(text: &Rope, head: usize, right: bool) -> usize {
+    if right {
+        next_boundary(text, head)
     } else {
-        text.char_to_byte(hc + 1)
+        prev_boundary(text, head)
     }
 }
 
 fn vertical(text: &Rope, head: usize, up: bool) -> usize {
-    let hc = text.byte_to_char(head);
-    let line = text.char_to_line(hc);
-    let target_line = if up {
-        if line == 0 {
+    let point = text.offset_to_point(head);
+    let target_row = if up {
+        if point.row == 0 {
             return head;
         }
-        line - 1
+        point.row - 1
     } else {
-        if line + 1 >= text.len_lines() {
+        if point.row + 1 > text.max_point().row {
             return head;
         }
-        line + 1
+        point.row + 1
     };
-    let col = hc - text.line_to_char(line);
-    let target_len = visual_line_len_chars(text, target_line);
-    let target_char = text.line_to_char(target_line) + col.min(target_len);
-    text.char_to_byte(target_char)
+    // Keep the column, clamped to the target line's content length.
+    let col = point.column.min(line_content_len(text, target_row));
+    text.point_to_offset(Point::new(target_row, col))
 }
 
 fn word_right(text: &Rope, head: usize) -> usize {
-    let len = text.len_chars();
-    let mut i = text.byte_to_char(head);
-    while i < len && is_word(text.char(i)) {
-        i += 1;
+    let len = text.len();
+    let mut i = head;
+    let mut chars = text.chars_at(head);
+    // Skip the run of word chars, then the run of non-word chars, landing on the
+    // next word's start (mirrors the prior char-indexed scan, byte-stepping).
+    let mut pending = chars.next();
+    while i < len {
+        match pending {
+            Some(c) if is_word(c) => {
+                i += c.len_utf8();
+                pending = chars.next();
+            }
+            _ => break,
+        }
     }
-    while i < len && !is_word(text.char(i)) {
-        i += 1;
+    while i < len {
+        match pending {
+            Some(c) if !is_word(c) => {
+                i += c.len_utf8();
+                pending = chars.next();
+            }
+            _ => break,
+        }
     }
-    text.char_to_byte(i)
+    i
 }
 
 fn word_left(text: &Rope, head: usize) -> usize {
-    let mut i = text.byte_to_char(head);
-    while i > 0 && !is_word(text.char(i - 1)) {
-        i -= 1;
+    let mut i = head;
+    let mut chars = text.reversed_chars_at(head);
+    let mut pending = chars.next();
+    // Skip the run of non-word chars to the left, then the run of word chars,
+    // landing on the current/previous word's start.
+    while i > 0 {
+        match pending {
+            Some(c) if !is_word(c) => {
+                i -= c.len_utf8();
+                pending = chars.next();
+            }
+            _ => break,
+        }
     }
-    while i > 0 && is_word(text.char(i - 1)) {
-        i -= 1;
+    while i > 0 {
+        match pending {
+            Some(c) if is_word(c) => {
+                i -= c.len_utf8();
+                pending = chars.next();
+            }
+            _ => break,
+        }
     }
-    text.char_to_byte(i)
+    i
 }
 
 fn line_start(text: &Rope, head: usize) -> usize {
-    let line = text.char_to_line(text.byte_to_char(head));
-    text.line_to_byte(line)
+    let row = text.offset_to_point(head).row;
+    text.point_to_offset(Point::new(row, 0))
 }
 
 fn line_end(text: &Rope, head: usize) -> usize {
-    let line = text.char_to_line(text.byte_to_char(head));
-    let end_char = text.line_to_char(line) + visual_line_len_chars(text, line);
-    text.char_to_byte(end_char)
+    let row = text.offset_to_point(head).row;
+    text.point_to_offset(Point::new(row, line_content_len(text, row)))
 }
 
 fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
-    let line = text.char_to_line(text.byte_to_char(head));
+    let row = text.offset_to_point(head).row;
     let n = nav_line_count(text);
     let target = if up {
-        let mut j = line;
+        let mut j = row;
         while j > 0 && is_blank(text, j) {
             j -= 1;
         }
@@ -415,7 +432,7 @@ fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
         }
         is_blank(text, j).then_some(j)
     } else {
-        let mut j = line;
+        let mut j = row;
         while j < n && is_blank(text, j) {
             j += 1;
         }
@@ -425,7 +442,7 @@ fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
         (j < n).then_some(j)
     };
     match target {
-        Some(j) => text.line_to_byte(j),
+        Some(j) => text.point_to_offset(Point::new(j, 0)),
         None => head,
     }
 }
@@ -435,33 +452,30 @@ fn blank_line(text: &Rope, head: usize, up: bool) -> usize {
 /// on/inside). Nesting-aware and across lines. `None` if there is no bracket to
 /// act on.
 fn matching_bracket(text: &Rope, head: usize) -> Option<usize> {
-    let hc = text.byte_to_char(head);
-    if let Some(here) = text.get_char(hc) {
+    if let Some(here) = text.chars_at(head).next() {
         match here {
-            '(' | '[' | '{' => return close_for(text, hc).map(|i| text.char_to_byte(i)),
-            ')' | ']' | '}' => return open_for(text, hc).map(|i| text.char_to_byte(i)),
+            '(' | '[' | '{' => return close_for(text, head),
+            ')' | ']' | '}' => return open_for(text, head),
             _ => {}
         }
     }
     // Not on a delimiter: jump to the close of the pair that encloses `head`.
-    let op = enclosing_open(text, hc)?;
-    close_for(text, op).map(|i| text.char_to_byte(i))
+    let op = enclosing_open(text, head)?;
+    close_for(text, op)
 }
 
-/// The matching close for the opening bracket at char index `open` (else `None`).
+/// The matching close for the opening bracket at byte offset `open` (else `None`).
 fn close_for(text: &Rope, open: usize) -> Option<usize> {
-    let open_c = text.get_char(open)?;
+    let open_c = text.chars_at(open).next()?;
     let close_c = match open_c {
         '(' => ')',
         '[' => ']',
         '{' => '}',
         _ => return None,
     };
-    let len = text.len_chars();
     let mut depth = 0i32;
     let mut i = open;
-    while i < len {
-        let ch = text.char(i);
+    for ch in text.chars_at(open) {
         if ch == open_c {
             depth += 1;
         } else if ch == close_c {
@@ -470,24 +484,25 @@ fn close_for(text: &Rope, open: usize) -> Option<usize> {
                 return Some(i);
             }
         }
-        i += 1;
+        i += ch.len_utf8();
     }
     None
 }
 
-/// The matching open for the closing bracket at char index `close` (else `None`).
+/// The matching open for the closing bracket at byte offset `close` (else `None`).
 fn open_for(text: &Rope, close: usize) -> Option<usize> {
-    let close_c = text.get_char(close)?;
+    let close_c = text.chars_at(close).next()?;
     let open_c = match close_c {
         ')' => '(',
         ']' => '[',
         '}' => '{',
         _ => return None,
     };
+    // Scan left from (and including) the closing bracket, tracking byte offsets.
     let mut depth = 0i32;
-    let mut i = close;
-    loop {
-        let ch = text.char(i);
+    let mut i = next_boundary(text, close); // one past the close bracket
+    for ch in text.reversed_chars_at(next_boundary(text, close)) {
+        i -= ch.len_utf8();
         if ch == close_c {
             depth += 1;
         } else if ch == open_c {
@@ -496,21 +511,16 @@ fn open_for(text: &Rope, close: usize) -> Option<usize> {
                 return Some(i);
             }
         }
-        if i == 0 {
-            break;
-        }
-        i -= 1;
     }
     None
 }
 
-/// The nearest opening bracket enclosing char index `from` (scanning left).
+/// The nearest opening bracket enclosing byte offset `from` (scanning left).
 fn enclosing_open(text: &Rope, from: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = from;
-    while i > 0 {
-        i -= 1;
-        let ch = text.char(i);
+    for ch in text.reversed_chars_at(from) {
+        i -= ch.len_utf8();
         if matches!(ch, ')' | ']' | '}') {
             depth += 1;
         } else if matches!(ch, '(' | '[' | '{') {
@@ -577,7 +587,7 @@ mod tests {
     fn insert_char_inserts_and_advances_collapsed() {
         let mut b = at("abc", 0);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text, "Xabc");
+        assert_eq!(b.text.to_string(), "Xabc");
         assert_eq!(b.selection.primary(), Range::cursor(1));
     }
 
@@ -585,7 +595,7 @@ mod tests {
     fn insert_char_appends_at_end() {
         let mut b = at("abc", 3);
         run(&mut b, Action::InsertChar('Z'));
-        assert_eq!(b.text, "abcZ");
+        assert_eq!(b.text.to_string(), "abcZ");
         assert_eq!(head(&b), 4);
     }
 
@@ -593,7 +603,7 @@ mod tests {
     fn insert_multibyte_char_advances_by_byte_len() {
         let mut b = at("ab", 1);
         run(&mut b, Action::InsertChar('é')); // 2 bytes
-        assert_eq!(b.text, "aéb");
+        assert_eq!(b.text.to_string(), "aéb");
         assert_eq!(head(&b), 3);
     }
 
@@ -601,7 +611,7 @@ mod tests {
     fn insert_newline() {
         let mut b = at("ab", 1);
         run(&mut b, Action::InsertNewline);
-        assert_eq!(b.text, "a\nb");
+        assert_eq!(b.text.to_string(), "a\nb");
         assert_eq!(head(&b), 2);
     }
 
@@ -609,7 +619,7 @@ mod tests {
     fn delete_backward_removes_prev_char() {
         let mut b = at("abc", 2);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "ac");
+        assert_eq!(b.text.to_string(), "ac");
         assert_eq!(head(&b), 1);
     }
 
@@ -617,7 +627,7 @@ mod tests {
     fn delete_backward_at_start_is_noop() {
         let mut b = at("abc", 0);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "abc");
+        assert_eq!(b.text.to_string(), "abc");
         assert_eq!(head(&b), 0);
     }
 
@@ -625,7 +635,7 @@ mod tests {
     fn delete_backward_multibyte() {
         let mut b = at("aéb", 3); // cursor after 'é' (a=0, é=1..3)
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "ab");
+        assert_eq!(b.text.to_string(), "ab");
         assert_eq!(head(&b), 1);
     }
 
@@ -635,7 +645,7 @@ mod tests {
         // removes the whole span, not just one char.
         let mut b = span("abcde", 1, 4); // "bcd" selected
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "ae");
+        assert_eq!(b.text.to_string(), "ae");
         assert_eq!(b.selection.primary(), Range::cursor(1)); // caret at the span start
     }
 
@@ -643,7 +653,7 @@ mod tests {
     fn backspace_over_a_backward_span_deletes_the_selection() {
         let mut b = span("abcde", 4, 1); // same span, head left of anchor
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "ae");
+        assert_eq!(b.text.to_string(), "ae");
         assert_eq!(b.selection.primary(), Range::cursor(1));
     }
 
@@ -656,7 +666,7 @@ mod tests {
             primary: 0,
         };
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "cd");
+        assert_eq!(b.text.to_string(), "cd");
         assert_eq!(heads(&b), vec![0, 2]);
     }
 
@@ -666,7 +676,7 @@ mod tests {
         // typing 'X' must replace the span, not insert past it.
         let mut b = span("abc", 0, 3);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text, "X");
+        assert_eq!(b.text.to_string(), "X");
         assert_eq!(b.selection.primary(), Range::cursor(1));
     }
 
@@ -676,7 +686,7 @@ mod tests {
         // anchor) still replaces, and the caret lands past the inserted text.
         let mut b = span("abcde", 4, 1); // anchor=4, head=1 -> span [1,4) = "bcd"
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text, "aXe");
+        assert_eq!(b.text.to_string(), "aXe");
         assert_eq!(b.selection.primary(), Range::cursor(2)); // min(1)+len("X")
     }
 
@@ -684,7 +694,7 @@ mod tests {
     fn newline_over_a_span_replaces_it() {
         let mut b = span("abc", 0, 3);
         run(&mut b, Action::InsertNewline);
-        assert_eq!(b.text, "\n");
+        assert_eq!(b.text.to_string(), "\n");
         assert_eq!(b.selection.primary(), Range::cursor(1));
     }
 
@@ -697,7 +707,7 @@ mod tests {
             primary: 0,
         };
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text, "X X");
+        assert_eq!(b.text.to_string(), "X X");
         assert_eq!(heads(&b), vec![1, 3]);
     }
 
@@ -831,10 +841,10 @@ mod tests {
 
     #[test]
     fn blank_line_down_ignores_the_phantom_trailing_line() {
-        // A file ending in '\n' makes ropey report a phantom empty last line.
-        // It is not a blank line the user can see, so `]` must not jump to it —
-        // otherwise the same visible text behaves differently with/without a
-        // trailing newline.
+        // A file ending in '\n' has a phantom empty last line in the rope's
+        // line model. It is not a blank line the user can see, so `]` must not
+        // jump to it — otherwise the same visible text behaves differently
+        // with/without a trailing newline.
         let mut b = at("abc\ndef\n", 0);
         run(&mut b, mv(BlankLine(Direction::Down), false, 1));
         assert_eq!(head(&b), 0); // no real blank line below -> no-op
@@ -935,9 +945,9 @@ mod tests {
         let mut b = at("abc", 0);
         let mut h = History::new();
         apply(Action::InsertChar('X'), &mut b, &mut h);
-        assert_eq!(b.text, "Xabc");
+        assert_eq!(b.text.to_string(), "Xabc");
         apply(Action::Undo, &mut b, &mut h);
-        assert_eq!(b.text, "abc");
+        assert_eq!(b.text.to_string(), "abc");
         assert_eq!(b.selection.primary(), Range::cursor(0));
     }
 
@@ -947,7 +957,7 @@ mod tests {
     fn two_cursors_insert_at_both() {
         let mut b = cursors("abcde", &[1, 3]);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text, "aXbcXde");
+        assert_eq!(b.text.to_string(), "aXbcXde");
         assert_eq!(heads(&b), vec![2, 5]);
     }
 
@@ -963,7 +973,7 @@ mod tests {
         // cursors at 1 and 2: deleting before each removes "ab" -> both land at 0
         let mut b = cursors("abc", &[1, 2]);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text, "c");
+        assert_eq!(b.text.to_string(), "c");
         assert_eq!(b.selection.ranges.len(), 1);
         assert_eq!(b.selection.primary(), Range::cursor(0));
     }
@@ -1083,7 +1093,7 @@ mod tests {
         assert_eq!((p.min(), p.max()), (2, 4));
         apply(Action::Undo, &mut b, &mut h);
         assert_eq!(b.selection.primary(), Range::cursor(2));
-        assert_eq!(b.text, "a aa b");
+        assert_eq!(b.text.to_string(), "a aa b");
     }
 
     #[test]

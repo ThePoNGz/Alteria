@@ -1,0 +1,11 @@
+[package]
+name = "util"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"
