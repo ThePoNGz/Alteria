@@ -229,4 +229,43 @@ mod tests {
         assert!(!e.handle(InputEvent::ModifiersChanged { mods: ALT }));
         assert!(!e.handle(InputEvent::FocusLost));
     }
+
+    // ---- motion fidelity, end-to-end (plan 003) ------------------------
+
+    #[test]
+    fn grapheme_motion_steps_over_a_cluster_through_the_facade() {
+        // Hold Alt and step right over an "e" + combining-acute cluster (3 bytes)
+        // in a single press, then over the following ASCII 'x'.
+        let mut e = Editor::new("e\u{0301}x");
+        e.hold(ALT);
+        assert!(e.key('d', ALT));
+        assert_eq!(e.head(), 3); // past the whole grapheme cluster
+        assert!(e.key('d', ALT));
+        assert_eq!(e.head(), 4); // past 'x'
+    }
+
+    #[test]
+    fn goal_column_survives_a_short_line_through_the_facade() {
+        // col 3 -> down through a 2-col line -> down again restores col 3.
+        // "abcd\nef\nghij": a0 b1 c2 d3 \n4 e5 f6 \n7 g8 h9 i10 j11
+        let mut e = Editor::new("abcd\nef\nghij");
+        e.hold(ALT);
+        e.key('d', ALT);
+        e.key('d', ALT);
+        e.key('d', ALT); // to line0 col3 (byte 3)
+        assert_eq!(e.head(), 3);
+        e.key('s', ALT); // down -> "ef", clamped to col 2 (byte 7)
+        assert_eq!(e.head(), 7);
+        e.key('s', ALT); // down -> "ghij", col 3 restored (byte 11)
+        assert_eq!(e.head(), 11);
+    }
+
+    #[test]
+    fn word_right_lands_on_word_end_through_the_facade() {
+        // `E` ports Zed `next_word_end`: it stops at the end of "foo", before '.'.
+        let mut e = Editor::new("foo.bar");
+        e.hold(ALT);
+        assert!(e.key('e', ALT));
+        assert_eq!(e.head(), 3);
+    }
 }
