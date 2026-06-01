@@ -1,0 +1,37 @@
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/text.rs"
+doctest = false
+
+# Silence clippy style lints that fire on the vendored Zed source. Editing the
+# `.rs` to satisfy them would diverge from upstream (future Zed reads must line
+# up); we keep the logic verbatim and allow the lints here, as for rope/sum_tree.
+[lints.clippy]
+init_numbered_fields = "allow"
+should_implement_trait = "allow"
+too_many_arguments = "allow"
+wrong_self_convention = "allow"
+
+# Declared (empty) so the vendored `#[cfg(feature = "test-support")]` attributes
+# are a recognized cfg rather than `unexpected_cfgs` noise. Not wired to any dep:
+# the gated test-support surface (RandomCharIter / rand-based generators, the
+# `network` collab harness) was dropped during vendoring and is not built here.
+[features]
+test-support = []
+
+[dependencies]
+anyhow = "1.0.86"
+clock = { path = "../clock" }
+collections = { path = "../collections" }
+log = "0.4"
+parking_lot = "0.12.1"
+rope = { path = "../rope" }
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+sum_tree = { path = "../sum_tree" }
+util = { path = "../util-shim" }
