@@ -110,3 +110,13 @@ green).
   are fine for "feels instant on my files".
 - Language-scoped word characters (e.g. CSS `-` as a word char) — the `LanguageScope` branch of
   Zed's classifier is dropped until tree-sitter syntax lands.
+
+## 7. Reviewer correction (post-merge)
+
+This branch was cut from main **before** the plan-003 T2 fix (`2ff5752`), so it built against the
+old plan and implemented `E` (`word_right`) as **word-END** (Zed `next_word_end`) — which the
+executor correctly flagged in §4.1 as conflicting with KEYMAP's "`E` → start of next word".
+At merge, the Reviewer corrected `E` to **word-START** (the word-start predicate `previous_word_start`
+uses, applied forward — `Q` was already the correct backward template) and flipped the affected
+`word_right` tests + the facade e2e to the word-start spec (`"foo bar"` 0→4; `"foo.bar"` 0→3→4;
+`" foo"` 0→1). `Q`, grapheme motion, goal-column, and the classifier are unchanged. 171 tests pass.

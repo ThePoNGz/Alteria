@@ -429,24 +429,15 @@ fn vertical(text: &Rope, head: usize, up: bool) -> usize {
     vertical_goal(text, head, None, up).0
 }
 
-/// `E` — to the **end of the next word**, porting Zed `next_word_end`
-/// (`movement.rs`): stop at the first `kind(left) != kind(right)` where `left`
-/// is non-whitespace (so whitespace runs are skipped, and the stop lands at a
-/// word's trailing edge), or at a newline. Zed's first-step rule steps over
-/// leading punctuation so `|.foo` advances to `.foo|`.
+/// `E` — to the **start of the next word** (KEYMAP: "start of next word").
+/// Alteria's `E`/`Q` are both word-*start* motions; Zed's `movement.rs` has no
+/// `next_word_start`, so this is the same word-start predicate `previous_word_start`
+/// uses — `kind(left) != kind(right)` with `right` non-whitespace, i.e. the start
+/// of a new Word/Punctuation run — applied *forward*. Whitespace runs are skipped;
+/// punctuation is its own run, so `.`/`(` are stops. Stops at a newline.
 fn word_right(text: &Rope, head: usize) -> usize {
-    let mut first = true;
     find_boundary(text, head, |left, right| {
-        if first
-            && char_kind(left) == CharKind::Punctuation
-            && char_kind(right) != CharKind::Punctuation
-            && right != '\n'
-        {
-            first = false;
-            return false;
-        }
-        first = false;
-        (char_kind(left) != char_kind(right) && char_kind(left) != CharKind::Whitespace)
+        (char_kind(left) != char_kind(right) && char_kind(right) != CharKind::Whitespace)
             || right == '\n'
     })
 }
@@ -873,15 +864,15 @@ mod tests {
         assert_eq!(head(&b), 1);
     }
 
-    // ---- word motion (Zed next_word_end / previous_word_start) ----------
+    // ---- word motion (E = next-word-start, Q = previous-word-start) -----
 
     #[test]
-    fn word_right_lands_on_the_word_end() {
-        // `E` ports Zed `next_word_end`: it stops at the end of the word it is
-        // in/entering, not at the start of the following word.
+    fn word_right_lands_on_next_word_start() {
+        // `E` = start of the next word (KEYMAP): from the start of "foo" it
+        // skips to the start of "bar", not the end of "foo".
         let mut b = at("foo bar", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 3); // end of "foo"
+        assert_eq!(head(&b), 4); // start of "bar"
     }
 
     #[test]
@@ -892,19 +883,21 @@ mod tests {
     }
 
     #[test]
-    fn word_right_from_mid_word_reaches_word_end() {
+    fn word_right_from_mid_word_reaches_next_word_start() {
         let mut b = at("foo bar baz", 1); // inside "foo"
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 3); // end of "foo"
+        assert_eq!(head(&b), 4); // start of "bar"
     }
 
     #[test]
     fn word_right_stops_at_a_word_punctuation_boundary() {
-        // The three-class model: Word -> Punctuation is a boundary, so `E` from
-        // the start of "foo" stops before the '.', it does not skip to "bar".
+        // Three-class model: `.` starts its own (Punctuation) run, so `E` from
+        // the start of "foo" lands on the '.', then on "bar".
         let mut b = at("foo.bar", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 3);
+        assert_eq!(head(&b), 3); // the '.'
+        run(&mut b, mv(WordStart(Direction::Right), false, 1));
+        assert_eq!(head(&b), 4); // start of "bar"
     }
 
     #[test]
@@ -915,12 +908,12 @@ mod tests {
     }
 
     #[test]
-    fn word_right_skips_leading_whitespace_to_the_word_end() {
-        // Whitespace runs are skipped: from inside the leading space, `E` lands
-        // on the end of "foo", not its start.
+    fn word_right_skips_leading_whitespace_to_next_word_start() {
+        // Whitespace is skipped: from the leading space, `E` lands on the start
+        // of "foo".
         let mut b = at(" foo", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 4); // end of "foo"
+        assert_eq!(head(&b), 1); // start of "foo"
     }
 
     #[test]

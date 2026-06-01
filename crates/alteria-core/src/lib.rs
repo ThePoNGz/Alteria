@@ -261,11 +261,11 @@ mod tests {
     }
 
     #[test]
-    fn word_right_lands_on_word_end_through_the_facade() {
-        // `E` ports Zed `next_word_end`: it stops at the end of "foo", before '.'.
-        let mut e = Editor::new("foo.bar");
+    fn word_right_lands_on_next_word_start_through_the_facade() {
+        // `E` = start of the next word (KEYMAP): from 0 in "foo bar" → "bar".
+        let mut e = Editor::new("foo bar");
         e.hold(ALT);
         assert!(e.key('e', ALT));
-        assert_eq!(e.head(), 3);
+        assert_eq!(e.head(), 4);
     }
 }
