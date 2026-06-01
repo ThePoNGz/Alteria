@@ -138,7 +138,7 @@ mod tests {
         e.hold(ALT_SHIFT);
         e.key('d', ALT_SHIFT);
         e.key('d', ALT_SHIFT);
-        assert_eq!(e.buffer.selection.primary(), Range { anchor: 0, head: 2 });
+        assert_eq!(e.buffer.selection.primary(), Range::new(0, 2));
     }
 
     #[test]

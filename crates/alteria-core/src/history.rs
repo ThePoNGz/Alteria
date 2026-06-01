@@ -181,7 +181,7 @@ mod tests {
     fn expansion_step_undo_restores_selection_without_changing_text() {
         let mut buf = Buffer::from_str("hello");
         let expanded = Selection {
-            ranges: vec![Range { anchor: 0, head: 5 }],
+            ranges: vec![Range::new(0, 5)],
             primary: 0,
         };
         buf.selection = expanded.clone();

@@ -3,10 +3,11 @@
 //! Edits flow through a [`ChangeSet`] — even a single-char insert — so undo and
 //! multicursor fall out of the same machinery. Motions only move the selection
 //! and are not recorded in history. All coordinates are **byte offsets** into
-//! the byte-indexed [`rope::Rope`]; motions move by char boundaries (M0 —
-//! grapheme/column-memory refinement is later) using rope's `Point` and
-//! `chars_at`/`reversed_chars_at`, mirroring Zed's `movement.rs`. Every motion
-//! clamps at the buffer edges and never panics.
+//! the byte-indexed [`rope::Rope`]. Horizontal motion steps by **grapheme**
+//! (via the rope's grapheme-aware `clip_point`), vertical motion keeps a **goal
+//! column** across short lines, and word motion uses the three-class
+//! [`char_kind`](crate::char_kind) model — all mirroring Zed's `movement.rs`.
+//! Every motion clamps at the buffer edges and never panics.
 //!
 //! Multicursor: one edit builds a single [`ChangeSet`] over every range in the
 //! old coordinate space, applies it once, then maps every range into the new
@@ -173,14 +174,19 @@ fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
             .ranges
             .iter()
             .map(|r| {
-                let new_head = move_head(&buffer.text, r.head, motion, count);
+                let (new_head, goal) = move_range_head(&buffer.text, r, motion, count);
                 if extend {
                     Range {
                         anchor: r.anchor,
                         head: new_head,
+                        goal,
                     }
                 } else {
-                    Range::cursor(new_head)
+                    Range {
+                        anchor: new_head,
+                        head: new_head,
+                        goal,
+                    }
                 }
             })
             .collect(),
@@ -188,6 +194,18 @@ fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
     };
     moved.normalize();
     buffer.selection = moved;
+}
+
+/// Move one range's head, returning the new head and the goal column to carry
+/// forward. Vertical motion is goal-aware (it keeps the column across short
+/// lines); every other motion clears the goal — Zed resets `SelectionGoal` on
+/// horizontal motion and on edits.
+fn move_range_head(text: &Rope, r: &Range, motion: Motion, count: usize) -> (usize, Option<u32>) {
+    match motion {
+        Motion::Char(Direction::Up) => vertical_run(text, r.head, r.goal, count, true),
+        Motion::Char(Direction::Down) => vertical_run(text, r.head, r.goal, count, false),
+        _ => (move_head(text, r.head, motion, count), None),
+    }
 }
 
 /// `I`/`U`/`O`/`P`: expand the primary range one level and record a
@@ -359,22 +377,56 @@ fn char_horizontal(text: &Rope, head: usize, right: bool) -> usize {
     }
 }
 
-fn vertical(text: &Rope, head: usize, up: bool) -> usize {
+/// One row up/down preserving the goal column (Zed `up_by_rows`/`down_by_rows`):
+/// land at `min(goal, target line length)`, but return the *un-clamped* goal so
+/// a later longer line restores the column. The goal is seeded from the current
+/// column when `None`. A no-op at the first/last line returns the head and goal
+/// unchanged.
+fn vertical_goal(text: &Rope, head: usize, goal: Option<u32>, up: bool) -> (usize, Option<u32>) {
     let point = text.offset_to_point(head);
     let target_row = if up {
         if point.row == 0 {
-            return head;
+            return (head, goal);
         }
         point.row - 1
     } else {
         if point.row + 1 > text.max_point().row {
-            return head;
+            return (head, goal);
         }
         point.row + 1
     };
-    // Keep the column, clamped to the target line's content length.
-    let col = point.column.min(line_content_len(text, target_row));
-    text.point_to_offset(Point::new(target_row, col))
+    let goal_col = goal.unwrap_or(point.column);
+    let col = goal_col.min(line_content_len(text, target_row));
+    (
+        text.point_to_offset(Point::new(target_row, col)),
+        Some(goal_col),
+    )
+}
+
+/// Run vertical motion `count` times, threading the goal so the column is
+/// computed once and reused on each row. Stops early when clamped at an edge.
+fn vertical_run(
+    text: &Rope,
+    mut head: usize,
+    mut goal: Option<u32>,
+    count: usize,
+    up: bool,
+) -> (usize, Option<u32>) {
+    for _ in 0..count.max(1) {
+        let (next, next_goal) = vertical_goal(text, head, goal, up);
+        if next == head {
+            break; // clamped at the first/last line
+        }
+        head = next;
+        goal = next_goal;
+    }
+    (head, goal)
+}
+
+/// Offset-only vertical step (goal seeded from the current column). Used by
+/// `move_head` for completeness and by `spawn_cursor`, which don't track goals.
+fn vertical(text: &Rope, head: usize, up: bool) -> usize {
+    vertical_goal(text, head, None, up).0
 }
 
 /// `E` — to the **end of the next word**, porting Zed `next_word_end`
@@ -561,7 +613,7 @@ mod tests {
     fn span(text: &str, anchor: usize, head: usize) -> Buffer {
         let mut b = Buffer::from_str(text);
         b.selection = Selection {
-            ranges: vec![Range { anchor, head }],
+            ranges: vec![Range::new(anchor, head)],
             primary: 0,
         };
         b
@@ -673,7 +725,7 @@ mod tests {
         // "abcdef": spans "ab" [0,2) and "ef" [4,6) -> "cd".
         let mut b = Buffer::from_str("abcdef");
         b.selection = Selection {
-            ranges: vec![Range { anchor: 0, head: 2 }, Range { anchor: 4, head: 6 }],
+            ranges: vec![Range::new(0, 2), Range::new(4, 6)],
             primary: 0,
         };
         run(&mut b, Action::DeleteBackward);
@@ -714,7 +766,7 @@ mod tests {
         // "ab cd": select "ab" [0,2) and "cd" [3,5); typing 'X' replaces both.
         let mut b = Buffer::from_str("ab cd");
         b.selection = Selection {
-            ranges: vec![Range { anchor: 0, head: 2 }, Range { anchor: 3, head: 5 }],
+            ranges: vec![Range::new(0, 2), Range::new(3, 5)],
             primary: 0,
         };
         run(&mut b, Action::InsertChar('X'));
@@ -800,11 +852,16 @@ mod tests {
     }
 
     #[test]
-    fn vertical_clamps_column_to_shorter_line() {
-        // abcd\nef : a0 b1 c2 d3 \n4 e5 f6  (line1 "ef" has length 2)
-        let mut b = at("abcd\nef", 3); // line0 col3
+    fn vertical_goal_column_clamps_then_restores() {
+        // "abcd\nef\nghij": a0 b1 c2 d3 \n4 e5 f6 \n7 g8 h9 i10 j11
+        // The middle line "ef" is shorter; the goal column survives it so the
+        // third line restores column 3 (Zed goal-column behavior, not a plain
+        // clamp that would stick at column 2).
+        let mut b = at("abcd\nef\nghij", 3); // line0 col3
         run(&mut b, mv(Char(Direction::Down), false, 1));
-        assert_eq!(head(&b), 7); // clamped to end of "ef"
+        assert_eq!(head(&b), 7); // clamped to the end of "ef" (col 2)
+        run(&mut b, mv(Char(Direction::Down), false, 1));
+        assert_eq!(head(&b), 11); // col 3 restored on "ghij", not stuck at col 2
     }
 
     #[test]
@@ -997,9 +1054,9 @@ mod tests {
     fn extend_keeps_anchor_moves_head() {
         let mut b = at("abcde", 0);
         run(&mut b, mv(Char(Direction::Right), true, 1));
-        assert_eq!(b.selection.primary(), Range { anchor: 0, head: 1 });
+        assert_eq!(b.selection.primary(), Range::new(0, 1));
         run(&mut b, mv(Char(Direction::Right), true, 1));
-        assert_eq!(b.selection.primary(), Range { anchor: 0, head: 2 });
+        assert_eq!(b.selection.primary(), Range::new(0, 2));
     }
 
     #[test]
@@ -1060,7 +1117,7 @@ mod tests {
     fn esc_collapses_multicursor_to_the_primary() {
         let mut b = Buffer::from_str("abcde");
         b.selection = Selection {
-            ranges: vec![Range { anchor: 1, head: 2 }, Range { anchor: 3, head: 4 }],
+            ranges: vec![Range::new(1, 2), Range::new(3, 4)],
             primary: 1,
         };
         run(&mut b, Action::CollapseSelection);
@@ -1160,7 +1217,7 @@ mod tests {
         let mut h = History::new();
 
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        assert_eq!(b.selection.primary(), Range { anchor: 2, head: 4 }); // "aa"
+        assert_eq!(b.selection.primary(), Range::new(2, 4)); // "aa"
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
         let p = b.selection.primary();
         assert_eq!((p.min(), p.max()), (2, 6)); // "aa b"
@@ -1192,12 +1249,12 @@ mod tests {
         // entry and no orientation flip.
         let mut b = Buffer::from_str("abc");
         b.selection = Selection {
-            ranges: vec![Range { anchor: 3, head: 0 }],
+            ranges: vec![Range::new(3, 0)],
             primary: 0,
         };
         let mut h = History::new();
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        assert_eq!(b.selection.primary(), Range { anchor: 3, head: 0 }); // unchanged
+        assert_eq!(b.selection.primary(), Range::new(3, 0)); // unchanged
         assert!(!h.undo(&mut b)); // nothing committed: at the root
     }
 

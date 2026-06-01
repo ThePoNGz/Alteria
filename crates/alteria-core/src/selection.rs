@@ -12,14 +12,32 @@
 pub struct Range {
     pub anchor: usize,
     pub head: usize,
+    /// The remembered visual column for vertical motion (Zed's
+    /// `SelectionGoal::Column`). `Some(col)` lets up/down keep their column
+    /// across short lines; it is `None` until a vertical motion sets it and is
+    /// reset by horizontal motion and edits. A *byte* column (rope columns are
+    /// bytes); pixel-x goals are deferred to the frontend.
+    pub goal: Option<u32>,
 }
 
 impl Range {
-    /// A bare cursor at `pos` (`anchor == head == pos`).
+    /// A bare cursor at `pos` (`anchor == head == pos`), with no goal column.
     pub fn cursor(pos: usize) -> Self {
         Range {
             anchor: pos,
             head: pos,
+            goal: None,
+        }
+    }
+
+    /// A range from `anchor` to `head` with no goal column. The terse
+    /// constructor existing call sites use, so adding `goal` doesn't force every
+    /// `Range { .. }` literal to spell the field out.
+    pub fn new(anchor: usize, head: usize) -> Self {
+        Range {
+            anchor,
+            head,
+            goal: None,
         }
     }
 
@@ -88,10 +106,7 @@ impl Selection {
                 Some(last) if last.overlaps(&r) => {
                     let new_min = last.min().min(r.min());
                     let new_max = last.max().max(r.max());
-                    *last = Range {
-                        anchor: new_min,
-                        head: new_max,
-                    };
+                    *last = Range::new(new_min, new_max);
                 }
                 _ => merged.push(r),
             }
@@ -129,8 +144,8 @@ mod tests {
 
     #[test]
     fn min_max_independent_of_orientation() {
-        let forward = Range { anchor: 2, head: 7 };
-        let backward = Range { anchor: 7, head: 2 };
+        let forward = Range::new(2, 7);
+        let backward = Range::new(7, 2);
         assert_eq!((forward.min(), forward.max()), (2, 7));
         assert_eq!((backward.min(), backward.max()), (2, 7));
         assert!(!forward.is_empty());
@@ -149,23 +164,23 @@ mod tests {
 
     #[test]
     fn interior_overlapping_spans_overlap() {
-        let a = Range { anchor: 0, head: 3 };
-        let b = Range { anchor: 2, head: 5 };
+        let a = Range::new(0, 3);
+        let b = Range::new(2, 5);
         assert!(a.overlaps(&b));
         assert!(b.overlaps(&a));
     }
 
     #[test]
     fn touching_spans_do_not_overlap() {
-        let a = Range { anchor: 0, head: 2 };
-        let b = Range { anchor: 2, head: 4 };
+        let a = Range::new(0, 2);
+        let b = Range::new(2, 4);
         assert!(!a.overlaps(&b));
         assert!(!b.overlaps(&a));
     }
 
     #[test]
     fn cursor_inside_span_overlaps_but_at_far_edge_does_not() {
-        let span = Range { anchor: 0, head: 3 };
+        let span = Range::new(0, 3);
         assert!(Range::cursor(2).overlaps(&span));
         assert!(span.overlaps(&Range::cursor(2)));
         // A cursor exactly at the far edge is a distinct position.
@@ -175,7 +190,7 @@ mod tests {
     #[test]
     fn normalize_single_range_is_noop() {
         let mut s = Selection {
-            ranges: vec![Range { anchor: 7, head: 2 }],
+            ranges: vec![Range::new(7, 2)],
             primary: 0,
         };
         let before = s.clone();
@@ -186,7 +201,7 @@ mod tests {
     #[test]
     fn normalize_merges_overlapping_and_preserves_primary() {
         let mut s = Selection {
-            ranges: vec![Range { anchor: 0, head: 3 }, Range { anchor: 2, head: 5 }],
+            ranges: vec![Range::new(0, 3), Range::new(2, 5)],
             primary: 1,
         };
         s.normalize();
@@ -214,7 +229,7 @@ mod tests {
         // A bare primary cursor at 4 sits on the far edge of an earlier span
         // [2,4); it must stay the primary, not be reassigned to the span.
         let mut s = Selection {
-            ranges: vec![Range { anchor: 2, head: 4 }, Range::cursor(4)],
+            ranges: vec![Range::new(2, 4), Range::cursor(4)],
             primary: 1,
         };
         s.normalize();

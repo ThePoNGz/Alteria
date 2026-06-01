@@ -36,10 +36,7 @@ pub fn expand(text: &Rope, range: Range, kind: Expansion) -> Range {
         Expansion::BracketContent => bracket_content(text, lo, hi),
         Expansion::BracketAlternating => bracket_alternating(text, lo, hi),
     };
-    Range {
-        anchor: nlo,
-        head: nhi,
-    }
+    Range::new(nlo, nhi)
 }
 
 /// A word character — routed through the engine's shared [`char_kind`]
@@ -280,7 +277,7 @@ mod tests {
     use crate::action::Expansion::*;
 
     fn rng(anchor: usize, head: usize) -> Range {
-        Range { anchor, head }
+        Range::new(anchor, head)
     }
     /// Expand once and return the resulting span as `(min, max)` byte offsets.
     fn ex(text: &str, range: Range, kind: Expansion) -> (usize, usize) {
