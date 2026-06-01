@@ -13,6 +13,7 @@
 //! space and merges overlaps — so one keystroke edits all cursors atomically.
 
 use rope::{Point, Rope};
+use sum_tree::Bias;
 
 use crate::action::{Action, Direction, Expansion, Motion};
 use crate::buffer::{line_content_len, nav_line_count, Buffer};
@@ -80,8 +81,9 @@ fn delete_backward(buffer: &mut Buffer, history: &mut History) {
             if head == 0 {
                 targets.push(head); // at the buffer start: nothing to delete
             } else {
-                // Delete back to the previous char boundary (the char before head).
-                let from = prev_boundary(&buffer.text, head);
+                // Delete back over the whole previous grapheme cluster (Zed
+                // `backspace` = `movement::left` then delete), not one codepoint.
+                let from = grapheme_left(&buffer.text, head);
                 intervals.push((from, head));
                 targets.push(head); // map_pos lands it on the deletion start
             }
@@ -306,14 +308,6 @@ fn next_boundary(text: &Rope, i: usize) -> usize {
     }
 }
 
-/// The previous char boundary before byte offset `i` (clamped to 0).
-fn prev_boundary(text: &Rope, i: usize) -> usize {
-    match text.reversed_chars_at(i).next() {
-        Some(c) => i - c.len_utf8(),
-        None => i,
-    }
-}
-
 /// True when line `row` is empty or all whitespace. `row` must be a real line
 /// index (`<= max_point().row`). The line's content (excluding its `\n`) is
 /// scanned; a `\n`/`\r` break is itself whitespace, so this matches treating
@@ -324,11 +318,44 @@ fn is_blank(text: &Rope, row: u32) -> bool {
     text.slice(start..end).chars().all(|c| c.is_whitespace())
 }
 
+/// One grapheme cluster to the right of byte offset `head`, porting Zed
+/// `movement::right`: step one column forward (wrapping to the next line's start
+/// at a line end), then snap to a grapheme boundary with the rope's
+/// grapheme-aware `clip_point` (`Bias::Right`). Clamps at the buffer end.
+fn grapheme_right(text: &Rope, head: usize) -> usize {
+    let mut p = text.offset_to_point(head);
+    if p.column < text.line_len(p.row) {
+        p.column += 1;
+    } else if p.row < text.max_point().row {
+        p.row += 1;
+        p.column = 0;
+    } else {
+        return head; // already at the buffer end
+    }
+    text.point_to_offset(text.clip_point(p, Bias::Right))
+}
+
+/// One grapheme cluster to the left of byte offset `head`, porting Zed
+/// `movement::left`: step one column back (wrapping to the previous line's end),
+/// then snap with `clip_point` (`Bias::Left`). Clamps at the buffer start.
+fn grapheme_left(text: &Rope, head: usize) -> usize {
+    let mut p = text.offset_to_point(head);
+    if p.column > 0 {
+        p.column -= 1;
+    } else if p.row > 0 {
+        p.row -= 1;
+        p.column = text.line_len(p.row);
+    } else {
+        return head; // already at the buffer start
+    }
+    text.point_to_offset(text.clip_point(p, Bias::Left))
+}
+
 fn char_horizontal(text: &Rope, head: usize, right: bool) -> usize {
     if right {
-        next_boundary(text, head)
+        grapheme_right(text, head)
     } else {
-        prev_boundary(text, head)
+        grapheme_left(text, head)
     }
 }
 
@@ -727,6 +754,37 @@ mod tests {
         assert_eq!(head(&b), 1);
         run(&mut b, mv(Char(Direction::Right), false, 1)); // past 'é' (2 bytes)
         assert_eq!(head(&b), 3);
+    }
+
+    #[test]
+    fn char_right_crosses_a_full_grapheme_cluster() {
+        // "e" + combining acute is one grapheme (3 bytes); one Right step must
+        // cross the whole cluster, not stop on the codepoint boundary at byte 1.
+        let s = "e\u{0301}";
+        let mut b = at(s, 0);
+        run(&mut b, mv(Char(Direction::Right), false, 1));
+        assert_eq!(head(&b), s.len()); // past the cluster
+    }
+
+    #[test]
+    fn char_right_does_not_split_a_flag_emoji() {
+        // A regional-indicator flag is one grapheme spanning two 4-byte
+        // codepoints; Right crosses all 8 bytes in a single step.
+        let s = "🇺🇸";
+        let mut b = at(s, 0);
+        run(&mut b, mv(Char(Direction::Right), false, 1));
+        assert_eq!(head(&b), s.len());
+    }
+
+    #[test]
+    fn backspace_deletes_the_whole_previous_grapheme() {
+        // Backspace removes the previous grapheme cluster, not one codepoint:
+        // deleting back over "e" + combining acute clears the whole cluster.
+        let s = "e\u{0301}";
+        let mut b = at(s, s.len());
+        run(&mut b, Action::DeleteBackward);
+        assert_eq!(b.text.to_string(), "");
+        assert_eq!(head(&b), 0);
     }
 
     // ---- vertical motion ------------------------------------------------
