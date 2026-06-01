@@ -22,6 +22,7 @@
 use rope::Rope;
 
 use crate::action::Expansion;
+use crate::char_kind::{char_kind, CharKind};
 use crate::selection::Range;
 
 /// Expand `range` one level according to `kind`. Returns `range` unchanged when
@@ -35,15 +36,14 @@ pub fn expand(text: &Rope, range: Range, kind: Expansion) -> Range {
         Expansion::BracketContent => bracket_content(text, lo, hi),
         Expansion::BracketAlternating => bracket_alternating(text, lo, hi),
     };
-    Range {
-        anchor: nlo,
-        head: nhi,
-    }
+    Range::new(nlo, nhi)
 }
 
-/// A word character (alphanumeric or `_`).
+/// A word character — routed through the engine's shared [`char_kind`]
+/// classifier so expansion and motion agree on word semantics. (Expansion keeps
+/// its own bracket-aware stepping; only the word-char *definition* is unified.)
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    char_kind(c) == CharKind::Word
 }
 
 /// If `c` is an opening bracket, its matching close; else `None`.
@@ -277,7 +277,7 @@ mod tests {
     use crate::action::Expansion::*;
 
     fn rng(anchor: usize, head: usize) -> Range {
-        Range { anchor, head }
+        Range::new(anchor, head)
     }
     /// Expand once and return the resulting span as `(min, max)` byte offsets.
     fn ex(text: &str, range: Range, kind: Expansion) -> (usize, usize) {
