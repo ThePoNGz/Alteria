@@ -16,6 +16,7 @@ use rope::{Point, Rope};
 
 use crate::action::{Action, Direction, Expansion, Motion};
 use crate::buffer::{line_content_len, nav_line_count, Buffer};
+use crate::char_kind::{char_kind, find_boundary, find_preceding_boundary, CharKind};
 use crate::expand;
 use crate::find;
 use crate::history::{History, Transaction};
@@ -297,11 +298,6 @@ fn step(text: &Rope, head: usize, motion: Motion) -> usize {
     }
 }
 
-/// True when `c` is part of a word (alphanumeric or `_`).
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
 /// The next char boundary after byte offset `i` (clamped to the buffer end).
 fn next_boundary(text: &Rope, i: usize) -> usize {
     match text.chars_at(i).next() {
@@ -354,59 +350,47 @@ fn vertical(text: &Rope, head: usize, up: bool) -> usize {
     text.point_to_offset(Point::new(target_row, col))
 }
 
+/// `E` — to the **end of the next word**, porting Zed `next_word_end`
+/// (`movement.rs`): stop at the first `kind(left) != kind(right)` where `left`
+/// is non-whitespace (so whitespace runs are skipped, and the stop lands at a
+/// word's trailing edge), or at a newline. Zed's first-step rule steps over
+/// leading punctuation so `|.foo` advances to `.foo|`.
 fn word_right(text: &Rope, head: usize) -> usize {
-    let len = text.len();
-    let mut i = head;
-    let mut chars = text.chars_at(head);
-    // Skip the run of word chars, then the run of non-word chars, landing on the
-    // next word's start (mirrors the prior char-indexed scan, byte-stepping).
-    let mut pending = chars.next();
-    while i < len {
-        match pending {
-            Some(c) if is_word(c) => {
-                i += c.len_utf8();
-                pending = chars.next();
-            }
-            _ => break,
+    let mut first = true;
+    find_boundary(text, head, |left, right| {
+        if first
+            && char_kind(left) == CharKind::Punctuation
+            && char_kind(right) != CharKind::Punctuation
+            && right != '\n'
+        {
+            first = false;
+            return false;
         }
-    }
-    while i < len {
-        match pending {
-            Some(c) if !is_word(c) => {
-                i += c.len_utf8();
-                pending = chars.next();
-            }
-            _ => break,
-        }
-    }
-    i
+        first = false;
+        (char_kind(left) != char_kind(right) && char_kind(left) != CharKind::Whitespace)
+            || right == '\n'
+    })
 }
 
+/// `Q` — to the **start of the previous word**, porting Zed
+/// `previous_word_start`: scanning back, stop at the first `kind(left) !=
+/// kind(right)` where `right` is non-whitespace, or at a newline. The first-step
+/// rule steps over trailing punctuation so `bar.|` jumps to `|bar.`.
 fn word_left(text: &Rope, head: usize) -> usize {
-    let mut i = head;
-    let mut chars = text.reversed_chars_at(head);
-    let mut pending = chars.next();
-    // Skip the run of non-word chars to the left, then the run of word chars,
-    // landing on the current/previous word's start.
-    while i > 0 {
-        match pending {
-            Some(c) if !is_word(c) => {
-                i -= c.len_utf8();
-                pending = chars.next();
-            }
-            _ => break,
+    let mut first = true;
+    find_preceding_boundary(text, head, |left, right| {
+        if first
+            && char_kind(right) == CharKind::Punctuation
+            && char_kind(left) != CharKind::Punctuation
+            && left != '\n'
+        {
+            first = false;
+            return false;
         }
-    }
-    while i > 0 {
-        match pending {
-            Some(c) if is_word(c) => {
-                i -= c.len_utf8();
-                pending = chars.next();
-            }
-            _ => break,
-        }
-    }
-    i
+        first = false;
+        (char_kind(left) != char_kind(right) && char_kind(right) != CharKind::Whitespace)
+            || left == '\n'
+    })
 }
 
 fn line_start(text: &Rope, head: usize) -> usize {
@@ -774,13 +758,15 @@ mod tests {
         assert_eq!(head(&b), 1);
     }
 
-    // ---- word motion ----------------------------------------------------
+    // ---- word motion (Zed next_word_end / previous_word_start) ----------
 
     #[test]
-    fn word_right_to_next_word_start() {
+    fn word_right_lands_on_the_word_end() {
+        // `E` ports Zed `next_word_end`: it stops at the end of the word it is
+        // in/entering, not at the start of the following word.
         let mut b = at("foo bar", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 4); // start of "bar"
+        assert_eq!(head(&b), 3); // end of "foo"
     }
 
     #[test]
@@ -791,10 +777,44 @@ mod tests {
     }
 
     #[test]
-    fn word_right_from_mid_word() {
+    fn word_right_from_mid_word_reaches_word_end() {
         let mut b = at("foo bar baz", 1); // inside "foo"
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
-        assert_eq!(head(&b), 4); // start of "bar"
+        assert_eq!(head(&b), 3); // end of "foo"
+    }
+
+    #[test]
+    fn word_right_stops_at_a_word_punctuation_boundary() {
+        // The three-class model: Word -> Punctuation is a boundary, so `E` from
+        // the start of "foo" stops before the '.', it does not skip to "bar".
+        let mut b = at("foo.bar", 0);
+        run(&mut b, mv(WordStart(Direction::Right), false, 1));
+        assert_eq!(head(&b), 3);
+    }
+
+    #[test]
+    fn word_right_stops_at_an_open_bracket() {
+        let mut b = at("foo(bar)", 0);
+        run(&mut b, mv(WordStart(Direction::Right), false, 1));
+        assert_eq!(head(&b), 3); // before '('
+    }
+
+    #[test]
+    fn word_right_skips_leading_whitespace_to_the_word_end() {
+        // Whitespace runs are skipped: from inside the leading space, `E` lands
+        // on the end of "foo", not its start.
+        let mut b = at(" foo", 0);
+        run(&mut b, mv(WordStart(Direction::Right), false, 1));
+        assert_eq!(head(&b), 4); // end of "foo"
+    }
+
+    #[test]
+    fn word_left_skips_trailing_punctuation() {
+        // Zed's first-step rule: `Q` from `bar.|` jumps to `|bar.`, stepping
+        // over the trailing punctuation rather than stopping on it.
+        let mut b = at("bar.", 4);
+        run(&mut b, mv(WordStart(Direction::Left), false, 1));
+        assert_eq!(head(&b), 0); // start of "bar"
     }
 
     // ---- line edges -----------------------------------------------------
