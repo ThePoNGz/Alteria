@@ -5,7 +5,7 @@
 **Parallelism:** Runs **simultaneously with Plan 004** (disjoint files). Owns only `alteria-core/src/*` listed below; does **not** touch any `Cargo.toml`, the vendored crates, or `buffer.rs`/`transaction.rs`/`history.rs` (those are Plan 005's). Plan 005 depends on this plan's `selection.rs` goal field.
 
 > **Sources of truth:** `../CLAUDE.md`, `../KEYMAP.md`, and Zed at `../zed-main`:
-> - `crates/editor/src/movement.rs` — `left`/`right` + clip (`:39-74`), `up_by_rows`/`down_by_rows` (`:119-190`), `next_word_end`/`previous_word_start` (`:266-460`), the generic `find_boundary`/`find_preceding_boundary_point` scanners (`:672-753`).
+> - `crates/editor/src/movement.rs` — `left`/`right` + clip (`:39-74`), `up_by_rows`/`down_by_rows` (`:119-190`), `previous_word_start` (`:266`, the word-**start** boundary rule — Alteria reuses it in both directions; see T2), the generic `find_boundary`/`find_preceding_boundary_point` scanners (`:672-753`). (Note: Zed's forward word motion is `next_word_end` at `:441` — word-*end* — which Alteria does **not** use.)
 > - `crates/language/src/buffer.rs` — `enum CharKind` (`:579-588`), `CharClassifier::kind_with` (`:6066-6097`).
 > - Already vendored locally: `crates/rope/src/rope.rs` `clip_offset`/`clip_point`+`Bias` (`:534-559`), `chars_at`/`reversed_chars_at` (`:339-345`), `offset_to_point`/`point_to_offset` (`:396-464`); `crates/rope/src/chunk.rs` grapheme `clip_point` (`:587-621`). `Bias` is `sum_tree::Bias` (rope doesn't re-export it); `alteria-core` **already depends on `sum_tree`** (added in Plan 002 for exactly this), so `use sum_tree::Bias;` directly — no new dependency.
 
@@ -45,10 +45,10 @@ Does **not** touch `Cargo.toml` (no new dep), `buffer.rs`, `find.rs` (unless a s
 
 ### T2 — Word motion via CharKind
 **Files:** `src/executor.rs`, `src/expand.rs`
-- Rewrite `word_right`/`word_left` (executor) using `char_kind` + the scanners: stop at **Word↔Punctuation** boundaries and skip whitespace, matching Zed `next_word_end` (`movement.rs:441-460`) and `previous_word_start` (`:266-286`) — including Zed's first-iteration rule that skips trailing punctuation (`hello.|`→`|hello.`).
-- Replace `expand.rs`'s private `is_word` (`:45-47`) and word stepping (`word_span`, `next_word_end`, `prev_word_start`) with the shared `char_kind` classifier so expansion and motion agree on word semantics.
-- **Tests:** `"foo.bar"` — `WordStart(Right)` from 0 stops at `foo`'s end boundary (not jumping to `bar`); `"foo(bar)"` stops at `(`; whitespace runs are skipped; expansion word level matches.
-- **Commit:** `feat(core): word motion on the three-class CharKind model`.
+- **Alteria's `E`/`Q` are word-START motions** (`action.rs`: `WordStart(Right)` = start of the *next* word, `WordStart(Left)` = start of the *previous* word; there is **no** word-end motion — KEYMAP.md: "end-of-word is just `E` then `A`"). ⚠️ Zed's `movement.rs` has `previous_word_start` (`:266`) and `next_word_end` (`:441`) but **no `next_word_start`** (Zed's forward word motion goes to word-*end*, macOS-style) — so **do not use `next_word_end`**. Rewrite `word_right`/`word_left` (executor) with `char_kind` + the T1 scanners using the **word-start predicate** (kind changes *and* the right char is non-whitespace → the start of a new `Word`/`Punctuation` run): apply it **backward** for `Q` (this *is* Zed's `previous_word_start`, `:266`) and the **same predicate forward** for `E`. Punctuation is now its own class, so `.`/`(` are stops (the old alnum-only model skipped them).
+- Route `expand.rs`'s internal word helpers (`is_word`, `word_span`, and its expansion-local `next_word_end`/`prev_word_start` — these find word **spans for selection expansion**, *not* cursor motion) through the shared `char_kind` classifier, so expansion and motion agree on what a word is. (Its `next_word_end` is an expansion span-finder — not the cursor word-end motion Alteria deliberately doesn't have.)
+- **Tests:** `"foo.bar"` — `E` (`WordStart(Right)`) from col 0 → the `.` (col 3, start of the punctuation run) → `bar` (col 4); `"foo bar"` — `E` from 0 → col 4 (`bar`), whitespace skipped; `Q` from col 4 in `"foo bar"` → col 0 (`foo` start); expansion word level matches the classifier.
+- **Commit:** `feat(core): word-start motion (E/Q) on the three-class CharKind model`.
 
 ### T3 — Grapheme-correct horizontal motion
 **Files:** `src/executor.rs`
