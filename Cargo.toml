@@ -1,3 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["crates/alteria-core", "crates/sum_tree", "crates/rope", "crates/util-shim", "crates/clock", "crates/collections", "crates/text"]
+members = [
+    "crates/alteria-core",
+    "crates/sum_tree",
+    "crates/rope",
+    "crates/util-shim",
+    "crates/clock",
+    "crates/collections",
+    "crates/text",
+    "crates/alteria-gpui",
+]
+# Engine-only default set: `cargo test`/`build`/`clippy` with no `-p` stay
+# GPUI-free and fast (the green-fast TDD loop). The GPUI frontend builds
+# explicitly with `cargo run -p alteria-gpui`. `cargo test --workspace` still
+# compiles alteria-gpui; that is acceptable (it has only the pure-mapping tests).
+default-members = [
+    "crates/alteria-core",
+    "crates/sum_tree",
+    "crates/rope",
+    "crates/util-shim",
+    "crates/clock",
+    "crates/collections",
+    "crates/text",
+]
