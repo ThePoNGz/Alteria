@@ -16,14 +16,17 @@ doctest = false
 init_numbered_fields = "allow"
 should_implement_trait = "allow"
 too_many_arguments = "allow"
+type_complexity = "allow"        # `get_random_edits`'s return tuple (test-support helper)
 wrong_self_convention = "allow"
 
-# Declared (empty) so the vendored `#[cfg(feature = "test-support")]` attributes
-# are a recognized cfg rather than `unexpected_cfgs` noise. Not wired to any dep:
-# the gated test-support surface (RandomCharIter / rand-based generators, the
-# `network` collab harness) was dropped during vendoring and is not built here.
+# Mirrors Zed's `text`: enabling `test-support` exposes the vendored property-
+# test helpers (`RandomCharIter`-based generators, `edit_via_marked_text`) and so
+# pulls in `rand` and `util`'s matching surface. The gpui-based `mod tests` Zed
+# ships under this gate was dropped during vendoring (it needs `#[gpui::test]`,
+# and this layer is gpui-free, exactly as Zed's own `text` lib is) — only the
+# gpui-free helper *surface* is reproduced here.
 [features]
-test-support = []
+test-support = ["rand", "util/test-support"]
 
 [dependencies]
 anyhow = "1.0.86"
@@ -31,7 +34,16 @@ clock = { path = "../clock" }
 collections = { path = "../collections" }
 log = "0.4"
 parking_lot = "0.12.1"
+# Optional, matching Zed: only built for the `test-support` surface / tests.
+rand = { version = "0.9", optional = true }
 rope = { path = "../rope" }
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 sum_tree = { path = "../sum_tree" }
 util = { path = "../util-shim" }
+
+# The vendored `cfg(any(test, feature = "test-support"))` helpers reference
+# `rand` and `util`'s `test-support` surface; make both available to this crate's
+# own `cargo test` build (Zed wires these identically in its `[dev-dependencies]`).
+[dev-dependencies]
+rand = "0.9"
+util = { path = "../util-shim", features = ["test-support"] }

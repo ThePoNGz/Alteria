@@ -7,5 +7,20 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Mirrors Zed's `util`: the gated `test-support` surface (`RandomCharIter`, the
+# marked-text helpers) is what `text`'s property-test helpers consume, and it is
+# the only thing that needs `rand`. `text` turns this on for its test build.
+test-support = ["dep:rand"]
+
 [dependencies]
 log = "0.4"
+# Optional: only pulled in for the `test-support` surface, never for shipping
+# code. Pinned to Zed's `rand = "0.9"` so the vendored `RandomCharIter` (and the
+# `text` helpers that drive it) compile against the same API.
+rand = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# Makes `rand` available to this crate's own `cfg(test)` build (where the gated
+# `RandomCharIter` compiles) without requiring the `test-support` feature.
+rand = "0.9"

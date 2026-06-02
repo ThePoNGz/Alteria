@@ -87,3 +87,29 @@ feat(core): rebuild edit/undo/selection on Zed's text model (anchors + clock/Und
 fix(core): bare-cursor anchor bias + pub(crate) undo entry points (Zed parity)
 ```
 (plus this devlog.)
+
+## 11. Reviewer note — T0 completed at merge
+
+The executor work above delivered T1–T5 but left **T0** (the `text` test-harness
+wiring) undone, so `cargo test --workspace` still failed to compile the `text`
+crate's test target on the same pre-existing breakage 004 left behind
+(`rand` / `util::RandomCharIter` / `util::test::marked_text_ranges` unresolved).
+§8 only claimed `cargo build --workspace`, which masked it. Resolved during the
+plan-005 merge by reproducing **Zed's exact wiring** (no invented structure):
+
+- `util-shim`: vendored `RandomCharIter` and `test::marked_text_ranges` **verbatim**
+  from Zed's `util` (gated `cfg(any(test, feature = "test-support"))` as upstream);
+  added an optional `rand = "0.9"` (Zed's pin) behind a `test-support` feature.
+- `text/Cargo.toml`: wired `test-support = ["rand", "util/test-support"]` and the
+  matching `[dev-dependencies]` (`rand`, `util` with `test-support`) — identical to
+  Zed's `text` manifest. `text.rs` stays byte-for-byte verbatim. Added a
+  `type_complexity = "allow"` lint (vendored `get_random_edits` return type).
+
+**Still deferred (Planner follow-up):** Zed's gpui-based `#[gpui::test]` property-test
+*module* in `text` stays dropped — this layer is gpui-free exactly as Zed's own `text`
+**library** is (Zed only pulls gpui into `text` as a *dev-dependency* for that test
+runner). So the helper *surface* now matches Zed; running those randomized fuzz tests
+would need a gpui-free harness (or to skip the gpui-only ones) and is out of scope here.
+The collab/deferred-op surface (§7) likewise remains for a dedicated cleanup plan.
+Bar now met: **`cargo test --workspace` compiles and passes** (152 in `alteria-core`);
+`cargo clippy --workspace --all-targets` clean; `cargo tree` shows no `gpui`/`ropey`.
