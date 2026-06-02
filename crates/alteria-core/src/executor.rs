@@ -1,17 +1,22 @@
 //! The executor: applies one [`Action`] to the [`Buffer`] (and [`History`]).
 //!
-//! Edits flow through a [`ChangeSet`] — even a single-char insert — so undo and
-//! multicursor fall out of the same machinery. Motions only move the selection
-//! and are not recorded in history. All coordinates are **byte offsets** into
-//! the byte-indexed [`rope::Rope`]. Horizontal motion steps by **grapheme**
-//! (via the rope's grapheme-aware `clip_point`), vertical motion keeps a **goal
-//! column** across short lines, and word motion uses the three-class
-//! [`char_kind`](crate::char_kind) model — all mirroring Zed's `movement.rs`.
-//! Every motion clamps at the buffer edges and never panics.
+//! Edits flow through Zed's [`text::Buffer`](crate::buffer) — even a single-char
+//! insert — so undo (clock + `UndoMap`) and multicursor fall out of the same
+//! machinery. An action resolves the anchored [`Selections`](crate::selection)
+//! to **byte offsets** against the snapshot, does its math in offset space, then
+//! re-anchors; motions only move the selection and aren't recorded in history.
+//! Horizontal motion steps by **grapheme** (the rope's grapheme-aware
+//! `clip_point`), vertical motion keeps a **goal column** across short lines, and
+//! word motion uses the three-class [`char_kind`](crate::char_kind) model — all
+//! mirroring Zed's `movement.rs`. Every motion clamps at the buffer edges and
+//! never panics.
 //!
-//! Multicursor: one edit builds a single [`ChangeSet`] over every range in the
-//! old coordinate space, applies it once, then maps every range into the new
-//! space and merges overlaps — so one keystroke edits all cursors atomically.
+//! Multicursor: one edit builds a single set of (sorted, non-overlapping) byte
+//! ranges over every selection, applies it once through `text::Buffer::edit`,
+//! then re-places each caret and merges overlaps — so one keystroke edits all
+//! cursors atomically and the anchors ride the change.
+
+use std::ops::Range;
 
 use rope::{Point, Rope};
 use sum_tree::Bias;
@@ -21,9 +26,8 @@ use crate::buffer::{line_content_len, nav_line_count, Buffer};
 use crate::char_kind::{char_kind, find_boundary, find_preceding_boundary, CharKind};
 use crate::expand;
 use crate::find;
-use crate::history::{History, Transaction};
-use crate::selection::{Range, Selection};
-use crate::transaction::{Assoc, ChangeSet};
+use crate::history::History;
+use crate::selection::{Selection, SelectionGoal, Selections};
 
 /// Apply one action to the buffer, recording text edits in `history`.
 pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
@@ -48,7 +52,7 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
 }
 
 // ---------------------------------------------------------------------------
-// Edits — every text change flows through a ChangeSet committed to history.
+// Edits — every text change flows through `text::Buffer`, recorded in history.
 // ---------------------------------------------------------------------------
 
 /// Typing inserts `s` at every bare cursor and **replaces** every selected span
@@ -56,48 +60,56 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
 /// selection is "replaced"). Each resulting cursor lands just past the inserted
 /// text, regardless of the selection's orientation.
 fn insert_text(buffer: &mut Buffer, history: &mut History, s: &str) {
-    let changes: Vec<(usize, usize, String)> = buffer
-        .selection
-        .ranges
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+    let edits: Vec<(usize, usize, String)> = resolved
         .iter()
-        .map(|r| (r.min(), r.max(), s.to_string()))
+        .map(|sel| (sel.min(), sel.max(), s.to_string()))
         .collect();
     // Follow each range's span end so the caret lands past the inserted text
     // even for a backward selection (where `head` is the span's left edge).
-    let targets: Vec<usize> = buffer.selection.ranges.iter().map(|r| r.max()).collect();
-    apply_edit(buffer, history, changes, targets);
+    let targets: Vec<(usize, usize)> = resolved.iter().map(|sel| (sel.id, sel.max())).collect();
+    apply_edit(buffer, history, before, primary_id, edits, targets);
 }
 
 /// `Backspace`: a non-empty selection is deleted whole (standard editor
 /// behavior — without Alt held, Alteria is a normal editor); a bare cursor
-/// deletes the char before its head (a cursor at the buffer start contributes
-/// nothing). If nothing can be deleted it is a no-op.
+/// deletes the grapheme before its head (a cursor at the buffer start
+/// contributes nothing). If nothing can be deleted it is a no-op.
 fn delete_backward(buffer: &mut Buffer, history: &mut History) {
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+
     // Per-range deletion intervals, plus where each range's caret should land.
     let mut intervals: Vec<(usize, usize)> = Vec::new();
-    let mut targets: Vec<usize> = Vec::new();
-    for r in &buffer.selection.ranges {
-        if r.is_empty() {
-            let head = r.head;
-            if head == 0 {
-                targets.push(head); // at the buffer start: nothing to delete
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    {
+        let text = buffer.rope();
+        for sel in &resolved {
+            if sel.is_empty() {
+                let head = sel.head();
+                if head == 0 {
+                    targets.push((sel.id, head)); // at the buffer start: nothing to delete
+                } else {
+                    // Delete back over the whole previous grapheme cluster (Zed
+                    // `backspace` = `movement::left` then delete), not one codepoint.
+                    let from = grapheme_left(text, head);
+                    intervals.push((from, head));
+                    targets.push((sel.id, head)); // maps to the deletion start
+                }
             } else {
-                // Delete back over the whole previous grapheme cluster (Zed
-                // `backspace` = `movement::left` then delete), not one codepoint.
-                let from = grapheme_left(&buffer.text, head);
-                intervals.push((from, head));
-                targets.push(head); // map_pos lands it on the deletion start
+                // A selection is removed whole; the caret lands at its start.
+                intervals.push((sel.min(), sel.max()));
+                targets.push((sel.id, sel.min()));
             }
-        } else {
-            // A selection is removed whole; the caret lands at its start.
-            intervals.push((r.min(), r.max()));
-            targets.push(r.min());
         }
     }
     if intervals.is_empty() {
         return; // every cursor at the buffer start: no-op
     }
-    // Merge overlapping intervals so the changeset stays non-overlapping: a bare
+    // Merge overlapping intervals so the edit stays non-overlapping: a bare
     // cursor can sit on the shared edge of a neighbouring span's deletion.
     intervals.sort_by_key(|iv| iv.0);
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
@@ -107,173 +119,199 @@ fn delete_backward(buffer: &mut Buffer, history: &mut History) {
             _ => merged.push(iv),
         }
     }
-    let changes: Vec<(usize, usize, String)> = merged
+    let edits: Vec<(usize, usize, String)> = merged
         .into_iter()
         .map(|(a, b)| (a, b, String::new()))
         .collect();
-    apply_edit(buffer, history, changes, targets);
+    apply_edit(buffer, history, before, primary_id, edits, targets);
 }
 
-/// Build one changeset spanning all `changes` (in old coordinates), record its
-/// inverse + selections in history, apply it once, then place each resulting
-/// cursor at its mapped `target` and merge overlaps. `targets[i]` is the
-/// old-space byte position range `i` should follow (the span end for an insert,
-/// the head for a backspace); it is provided by the caller because the right
-/// landing spot differs per edit. Every range collapses to a bare cursor.
+/// Apply `edits` (each `(from, to, text)`, **sorted and non-overlapping** in old
+/// coordinates) as one undoable transaction, then place each cursor at its
+/// mapped `target` (`(id, old_offset)`) and merge overlaps. `target` offsets are
+/// mapped right-associatively, so a caret lands past inserted text and at a
+/// deletion's new left edge. Every range collapses to a bare cursor.
 fn apply_edit(
     buffer: &mut Buffer,
     history: &mut History,
-    mut changes: Vec<(usize, usize, String)>,
-    targets: Vec<usize>,
+    before: Selections,
+    primary_id: usize,
+    edits: Vec<(usize, usize, String)>,
+    targets: Vec<(usize, usize)>,
 ) {
-    changes.sort_by_key(|c| c.0);
-    let before_text = buffer.text.clone();
-    let selection_before = buffer.selection.clone();
-    let forward = ChangeSet::from_changes(before_text.len(), &changes);
-    let inverse = forward.invert(&before_text);
+    // (from, to, inserted_len) for mapping carets through the change.
+    let map_edits: Vec<(usize, usize, usize)> =
+        edits.iter().map(|(f, t, s)| (*f, *t, s.len())).collect();
+    let edit_pairs: Vec<(Range<usize>, String)> =
+        edits.into_iter().map(|(f, t, s)| (f..t, s)).collect();
 
-    // Map every target through the one changeset. `After` keeps a cursor past
-    // inserted text; at a deletion's right edge it lands on the deletion start.
-    let mut after = Selection {
-        ranges: targets
-            .iter()
-            .map(|&p| Range::cursor(forward.map_pos(p, Assoc::After)))
-            .collect(),
-        primary: selection_before.primary,
-    };
+    let tx = buffer.edit(edit_pairs);
 
-    if !forward.apply(&mut buffer.text) {
-        return; // malformed (should not happen for executor-built changes)
+    let new: Vec<Selection<usize>> = targets
+        .iter()
+        .map(|&(id, p)| Selection::cursor(id, map_offset(&map_edits, p)))
+        .collect();
+    buffer.set_selections(new, primary_id);
+
+    if let Some(tx) = tx {
+        let after = buffer.selection.clone();
+        history.record_edit(tx, before, after);
     }
-    after.normalize();
-    buffer.selection = after.clone();
-    history.commit(Transaction {
-        forward,
-        inverse,
-        selection_before,
-        selection_after: after,
-    });
+}
+
+/// Map an old byte offset to new space through `edits` (`(from, to, ins_len)`,
+/// sorted by `from`, non-overlapping), associating to the right: a caret at an
+/// insert boundary lands past the inserted text, and a caret inside a replaced
+/// region lands at the replacement's new left edge plus the inserted length.
+fn map_offset(edits: &[(usize, usize, usize)], p: usize) -> usize {
+    let mut delta: isize = 0;
+    for &(from, to, ins) in edits {
+        if p < from {
+            break; // this edit (and all later ones) start after p
+        }
+        if p >= to {
+            // Edit entirely before p: shift by its net length change.
+            delta += ins as isize - (to - from) as isize;
+        } else {
+            // p inside [from, to): land at the end of the inserted text.
+            return (from as isize + delta) as usize + ins;
+        }
+    }
+    (p as isize + delta) as usize
 }
 
 // ---------------------------------------------------------------------------
 // Selection-only actions.
 // ---------------------------------------------------------------------------
 
-/// `Esc`: collapse the primary span to a bare cursor at its head.
+/// `Esc`: collapse to a single bare cursor at the primary's head (dropping any
+/// secondary cursors).
 fn collapse(buffer: &mut Buffer) {
-    let head = buffer.selection.primary().head;
-    buffer.selection = Selection::at(head);
+    let head = buffer.primary_resolved().head();
+    buffer.set_cursor(head);
 }
 
-/// Move every range's head `count` times, extending or collapsing, then merge
-/// any ranges that now coincide.
+/// Move every selection's head `count` times, extending or collapsing, then
+/// merge any selections that now coincide.
 fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
-    let mut moved = Selection {
-        ranges: buffer
-            .selection
-            .ranges
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+    let new: Vec<Selection<usize>> = {
+        let text = buffer.rope();
+        resolved
             .iter()
-            .map(|r| {
-                let (new_head, goal) = move_range_head(&buffer.text, r, motion, count);
+            .map(|sel| {
+                let (new_head, goal) = move_range_head(text, sel.head(), sel.goal, motion, count);
                 if extend {
-                    Range {
-                        anchor: r.anchor,
-                        head: new_head,
-                        goal,
-                    }
+                    let mut s = *sel;
+                    s.set_head(new_head, goal);
+                    s
                 } else {
-                    Range {
-                        anchor: new_head,
-                        head: new_head,
+                    Selection {
+                        id: sel.id,
+                        start: new_head,
+                        end: new_head,
+                        reversed: false,
                         goal,
                     }
                 }
             })
-            .collect(),
-        primary: buffer.selection.primary,
+            .collect()
     };
-    moved.normalize();
-    buffer.selection = moved;
+    buffer.set_selections(new, primary_id);
 }
 
-/// Move one range's head, returning the new head and the goal column to carry
-/// forward. Vertical motion is goal-aware (it keeps the column across short
-/// lines); every other motion clears the goal — Zed resets `SelectionGoal` on
-/// horizontal motion and on edits.
-fn move_range_head(text: &Rope, r: &Range, motion: Motion, count: usize) -> (usize, Option<u32>) {
+/// Move one head, returning the new head and the goal column to carry forward.
+/// Vertical motion is goal-aware (it keeps the column across short lines); every
+/// other motion clears the goal — Zed resets `SelectionGoal` on horizontal
+/// motion and on edits.
+fn move_range_head(
+    text: &Rope,
+    head: usize,
+    goal: SelectionGoal,
+    motion: Motion,
+    count: usize,
+) -> (usize, SelectionGoal) {
     match motion {
-        Motion::Char(Direction::Up) => vertical_run(text, r.head, r.goal, count, true),
-        Motion::Char(Direction::Down) => vertical_run(text, r.head, r.goal, count, false),
-        _ => (move_head(text, r.head, motion, count), None),
+        Motion::Char(Direction::Up) => {
+            let (h, g) = vertical_run(text, head, goal.column(), count, true);
+            (h, SelectionGoal::from_column(g))
+        }
+        Motion::Char(Direction::Down) => {
+            let (h, g) = vertical_run(text, head, goal.column(), count, false);
+            (h, SelectionGoal::from_column(g))
+        }
+        _ => (move_head(text, head, motion, count), SelectionGoal::None),
     }
 }
 
-/// `I`/`U`/`O`/`P`: expand the primary range one level and record a
-/// selection-only history entry (identity changeset) so `Ctrl+Z` steps back
-/// through expansions too. Outermost level is a no-op (no history entry).
+/// `I`/`U`/`O`/`P`: expand the primary selection one level and record a
+/// selection-only history entry so `Ctrl+Z` steps back through expansions too.
+/// The outermost level is a no-op (no history entry).
 fn expand_primary(buffer: &mut Buffer, history: &mut History, kind: Expansion) {
-    let primary = buffer.selection.primary();
-    let new_range = expand::expand(&buffer.text, primary, kind);
+    let primary = buffer.primary_resolved();
+    let (nlo, nhi) = {
+        let text = buffer.rope();
+        expand::expand(text, primary.min(), primary.max(), kind)
+    };
     // Compare by span, not orientation: `expand` returns a forward range, so a
-    // backward primary at the outermost level must still be recognized as a
-    // no-op (no orientation flip, no spurious history entry).
-    if new_range.min() == primary.min() && new_range.max() == primary.max() {
+    // backward primary at the outermost level is still recognized as a no-op (no
+    // orientation flip, no spurious history entry).
+    if (nlo, nhi) == (primary.min(), primary.max()) {
         return;
     }
-    let selection_before = buffer.selection.clone();
-    let mut after = buffer.selection.clone();
-    let p = after.primary;
-    after.ranges[p] = new_range;
-    after.normalize(); // a wider primary may now swallow a sibling cursor
-    buffer.selection = after.clone();
-
-    let id = ChangeSet::identity(buffer.text.len());
-    history.commit(Transaction {
-        forward: id.clone(),
-        inverse: id,
-        selection_before,
-        selection_after: after,
-    });
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let mut resolved = buffer.resolved();
+    if let Some(s) = resolved.iter_mut().find(|s| s.id == primary_id) {
+        s.start = nlo;
+        s.end = nhi;
+        s.reversed = false;
+        s.goal = SelectionGoal::None;
+    }
+    buffer.set_selections(resolved, primary_id); // a wider primary may swallow a sibling
+    let after = buffer.selection.clone();
+    history.record_selection(before, after);
 }
 
 /// `Alt+F` find: move every cursor's head to the next/previous occurrence of
-/// `ch` on its own line, collapsing each to a bare cursor. A cursor with no
-/// match on its line stays put (so a single bare cursor with no match is a
-/// no-op). Like every other motion it maps over all ranges rather than dropping
-/// the secondary cursors. Find is a motion, so it is not recorded in history.
+/// `ch` on its own line, collapsing each match to a bare cursor. A cursor with
+/// no match on its line stays put (so a single bare cursor with no match is a
+/// no-op). Find is a motion, so it is not recorded in history.
 fn find_move(buffer: &mut Buffer, ch: char, forward: bool) {
-    let mut moved = Selection {
-        ranges: buffer
-            .selection
-            .ranges
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+    let new: Vec<Selection<usize>> = {
+        let text = buffer.rope();
+        resolved
             .iter()
             .map(
-                |r| match find::find_on_line(&buffer.text, r.head, ch, forward) {
-                    Some(new_head) => Range::cursor(new_head),
-                    None => *r,
+                |sel| match find::find_on_line(text, sel.head(), ch, forward) {
+                    Some(new_head) => Selection::cursor(sel.id, new_head),
+                    None => *sel, // no match: leave this selection untouched
                 },
             )
-            .collect(),
-        primary: buffer.selection.primary,
+            .collect()
     };
-    moved.normalize();
-    buffer.selection = moved;
+    buffer.set_selections(new, primary_id);
 }
 
 /// Provisional (`KEYMAP.md` "not yet specified"): add a bare cursor one line
 /// above/below the primary at the same column and make it the new primary, so
 /// repeated spawns build a column. No-op when there is no line that way.
 fn spawn_cursor(buffer: &mut Buffer, dir: Direction) {
-    let primary = buffer.selection.primary();
-    let new_head = vertical(&buffer.text, primary.head, matches!(dir, Direction::Up));
-    if new_head == primary.head {
+    let primary = buffer.primary_resolved();
+    let new_head = {
+        let text = buffer.rope();
+        vertical(text, primary.head(), matches!(dir, Direction::Up))
+    };
+    if new_head == primary.head() {
         return;
     }
-    let mut sel = buffer.selection.clone();
-    sel.ranges.push(Range::cursor(new_head));
-    sel.primary = sel.ranges.len() - 1;
-    sel.normalize();
-    buffer.selection = sel;
+    let new_id = buffer.alloc_id();
+    let mut resolved = buffer.resolved();
+    resolved.push(Selection::cursor(new_id, new_head));
+    buffer.set_selections(resolved, new_id); // the new cursor becomes primary
 }
 
 // ---------------------------------------------------------------------------
@@ -596,29 +634,59 @@ mod tests {
     use super::*;
     use crate::action::Motion::*;
 
+    // ---- builders / accessors (offset-space views of the new model) -----
+
     fn at(text: &str, head: usize) -> Buffer {
         let mut b = Buffer::from_str(text);
-        b.selection = Selection::at(head);
+        b.set_cursor(head);
         b
     }
     fn span(text: &str, anchor: usize, head: usize) -> Buffer {
         let mut b = Buffer::from_str(text);
-        b.selection = Selection {
-            ranges: vec![Range::new(anchor, head)],
-            primary: 0,
+        let (start, end, reversed) = if head >= anchor {
+            (anchor, head, false)
+        } else {
+            (head, anchor, true)
         };
+        let id = b.primary_id();
+        b.set_selections(
+            vec![Selection {
+                id,
+                start,
+                end,
+                reversed,
+                goal: SelectionGoal::None,
+            }],
+            id,
+        );
         b
     }
     fn cursors(text: &str, heads: &[usize]) -> Buffer {
         let mut b = Buffer::from_str(text);
-        b.selection = Selection {
-            ranges: heads.iter().map(|&h| Range::cursor(h)).collect(),
-            primary: 0,
-        };
+        let sels: Vec<Selection<usize>> = heads
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| Selection::cursor(i, h))
+            .collect();
+        b.set_selections(sels, 0);
         b
     }
+    /// Heads of every selection, in stored (position-sorted) order.
     fn heads(b: &Buffer) -> Vec<usize> {
-        b.selection.ranges.iter().map(|r| r.head).collect()
+        b.resolved().iter().map(|s| s.head()).collect()
+    }
+    /// The primary head.
+    fn head(b: &Buffer) -> usize {
+        b.primary_resolved().head()
+    }
+    /// The primary span as `(min, max)`.
+    fn span_of(b: &Buffer) -> (usize, usize) {
+        let p = b.primary_resolved();
+        (p.min(), p.max())
+    }
+    /// The number of live selections.
+    fn count(b: &Buffer) -> usize {
+        b.selection.selections.len()
     }
     fn mv(motion: Motion, extend: bool, count: usize) -> Action {
         Action::Move {
@@ -631,9 +699,6 @@ mod tests {
         let mut h = History::new();
         apply(action, buffer, &mut h);
     }
-    fn head(b: &Buffer) -> usize {
-        b.selection.primary().head
-    }
 
     // ---- edits ----------------------------------------------------------
 
@@ -641,15 +706,16 @@ mod tests {
     fn insert_char_inserts_and_advances_collapsed() {
         let mut b = at("abc", 0);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text.to_string(), "Xabc");
-        assert_eq!(b.selection.primary(), Range::cursor(1));
+        assert_eq!(b.text(), "Xabc");
+        assert_eq!(head(&b), 1);
+        assert!(b.primary_resolved().is_empty());
     }
 
     #[test]
     fn insert_char_appends_at_end() {
         let mut b = at("abc", 3);
         run(&mut b, Action::InsertChar('Z'));
-        assert_eq!(b.text.to_string(), "abcZ");
+        assert_eq!(b.text(), "abcZ");
         assert_eq!(head(&b), 4);
     }
 
@@ -657,7 +723,7 @@ mod tests {
     fn insert_multibyte_char_advances_by_byte_len() {
         let mut b = at("ab", 1);
         run(&mut b, Action::InsertChar('é')); // 2 bytes
-        assert_eq!(b.text.to_string(), "aéb");
+        assert_eq!(b.text(), "aéb");
         assert_eq!(head(&b), 3);
     }
 
@@ -665,7 +731,7 @@ mod tests {
     fn insert_newline() {
         let mut b = at("ab", 1);
         run(&mut b, Action::InsertNewline);
-        assert_eq!(b.text.to_string(), "a\nb");
+        assert_eq!(b.text(), "a\nb");
         assert_eq!(head(&b), 2);
     }
 
@@ -673,7 +739,7 @@ mod tests {
     fn delete_backward_removes_prev_char() {
         let mut b = at("abc", 2);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "ac");
+        assert_eq!(b.text(), "ac");
         assert_eq!(head(&b), 1);
     }
 
@@ -681,7 +747,7 @@ mod tests {
     fn delete_backward_at_start_is_noop() {
         let mut b = at("abc", 0);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "abc");
+        assert_eq!(b.text(), "abc");
         assert_eq!(head(&b), 0);
     }
 
@@ -689,79 +755,106 @@ mod tests {
     fn delete_backward_multibyte() {
         let mut b = at("aéb", 3); // cursor after 'é' (a=0, é=1..3)
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "ab");
+        assert_eq!(b.text(), "ab");
         assert_eq!(head(&b), 1);
     }
 
     #[test]
     fn backspace_over_a_span_deletes_the_selection() {
-        // Without Alt, Alteria is a normal editor: Backspace over a selection
-        // removes the whole span, not just one char.
         let mut b = span("abcde", 1, 4); // "bcd" selected
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "ae");
-        assert_eq!(b.selection.primary(), Range::cursor(1)); // caret at the span start
+        assert_eq!(b.text(), "ae");
+        assert_eq!(head(&b), 1);
+        assert!(b.primary_resolved().is_empty());
     }
 
     #[test]
     fn backspace_over_a_backward_span_deletes_the_selection() {
         let mut b = span("abcde", 4, 1); // same span, head left of anchor
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "ae");
-        assert_eq!(b.selection.primary(), Range::cursor(1));
+        assert_eq!(b.text(), "ae");
+        assert_eq!(head(&b), 1);
     }
 
     #[test]
     fn backspace_over_multiple_spans_deletes_each() {
         // "abcdef": spans "ab" [0,2) and "ef" [4,6) -> "cd".
         let mut b = Buffer::from_str("abcdef");
-        b.selection = Selection {
-            ranges: vec![Range::new(0, 2), Range::new(4, 6)],
-            primary: 0,
-        };
+        b.set_selections(
+            vec![
+                Selection {
+                    id: 0,
+                    start: 0,
+                    end: 2,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+                Selection {
+                    id: 1,
+                    start: 4,
+                    end: 6,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+            ],
+            0,
+        );
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "cd");
+        assert_eq!(b.text(), "cd");
         assert_eq!(heads(&b), vec![0, 2]);
     }
 
     #[test]
     fn typing_over_a_forward_span_replaces_it() {
-        // KEYMAP.md: "typing replaces it." The whole word "abc" is selected;
-        // typing 'X' must replace the span, not insert past it.
         let mut b = span("abc", 0, 3);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text.to_string(), "X");
-        assert_eq!(b.selection.primary(), Range::cursor(1));
+        assert_eq!(b.text(), "X");
+        assert_eq!(head(&b), 1);
     }
 
     #[test]
     fn typing_over_a_backward_span_replaces_it() {
-        // Orientation must not matter: "bcd" selected backward (head left of
-        // anchor) still replaces, and the caret lands past the inserted text.
+        // Orientation must not matter: "bcd" selected backward still replaces,
+        // and the caret lands past the inserted text.
         let mut b = span("abcde", 4, 1); // anchor=4, head=1 -> span [1,4) = "bcd"
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text.to_string(), "aXe");
-        assert_eq!(b.selection.primary(), Range::cursor(2)); // min(1)+len("X")
+        assert_eq!(b.text(), "aXe");
+        assert_eq!(head(&b), 2); // min(1)+len("X")
     }
 
     #[test]
     fn newline_over_a_span_replaces_it() {
         let mut b = span("abc", 0, 3);
         run(&mut b, Action::InsertNewline);
-        assert_eq!(b.text.to_string(), "\n");
-        assert_eq!(b.selection.primary(), Range::cursor(1));
+        assert_eq!(b.text(), "\n");
+        assert_eq!(head(&b), 1);
     }
 
     #[test]
     fn typing_over_multiple_spans_replaces_each() {
         // "ab cd": select "ab" [0,2) and "cd" [3,5); typing 'X' replaces both.
         let mut b = Buffer::from_str("ab cd");
-        b.selection = Selection {
-            ranges: vec![Range::new(0, 2), Range::new(3, 5)],
-            primary: 0,
-        };
+        b.set_selections(
+            vec![
+                Selection {
+                    id: 0,
+                    start: 0,
+                    end: 2,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+                Selection {
+                    id: 1,
+                    start: 3,
+                    end: 5,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+            ],
+            0,
+        );
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text.to_string(), "X X");
+        assert_eq!(b.text(), "X X");
         assert_eq!(heads(&b), vec![1, 3]);
     }
 
@@ -801,8 +894,6 @@ mod tests {
 
     #[test]
     fn char_right_crosses_a_full_grapheme_cluster() {
-        // "e" + combining acute is one grapheme (3 bytes); one Right step must
-        // cross the whole cluster, not stop on the codepoint boundary at byte 1.
         let s = "e\u{0301}";
         let mut b = at(s, 0);
         run(&mut b, mv(Char(Direction::Right), false, 1));
@@ -811,8 +902,6 @@ mod tests {
 
     #[test]
     fn char_right_does_not_split_a_flag_emoji() {
-        // A regional-indicator flag is one grapheme spanning two 4-byte
-        // codepoints; Right crosses all 8 bytes in a single step.
         let s = "🇺🇸";
         let mut b = at(s, 0);
         run(&mut b, mv(Char(Direction::Right), false, 1));
@@ -821,12 +910,10 @@ mod tests {
 
     #[test]
     fn backspace_deletes_the_whole_previous_grapheme() {
-        // Backspace removes the previous grapheme cluster, not one codepoint:
-        // deleting back over "e" + combining acute clears the whole cluster.
         let s = "e\u{0301}";
         let mut b = at(s, s.len());
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "");
+        assert_eq!(b.text(), "");
         assert_eq!(head(&b), 0);
     }
 
@@ -834,7 +921,6 @@ mod tests {
 
     #[test]
     fn vertical_down_then_up_keeps_column() {
-        // a0 b1 c2 \n3 d4 e5 f6
         let mut b = at("abc\ndef", 1);
         run(&mut b, mv(Char(Direction::Down), false, 1));
         assert_eq!(head(&b), 5); // line1 col1
@@ -844,10 +930,8 @@ mod tests {
 
     #[test]
     fn vertical_goal_column_clamps_then_restores() {
-        // "abcd\nef\nghij": a0 b1 c2 d3 \n4 e5 f6 \n7 g8 h9 i10 j11
-        // The middle line "ef" is shorter; the goal column survives it so the
-        // third line restores column 3 (Zed goal-column behavior, not a plain
-        // clamp that would stick at column 2).
+        // "abcd\nef\nghij": the middle line "ef" is shorter; the goal column
+        // survives it so the third line restores column 3.
         let mut b = at("abcd\nef\nghij", 3); // line0 col3
         run(&mut b, mv(Char(Direction::Down), false, 1));
         assert_eq!(head(&b), 7); // clamped to the end of "ef" (col 2)
@@ -868,8 +952,6 @@ mod tests {
 
     #[test]
     fn word_right_lands_on_next_word_start() {
-        // `E` = start of the next word (KEYMAP): from the start of "foo" it
-        // skips to the start of "bar", not the end of "foo".
         let mut b = at("foo bar", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
         assert_eq!(head(&b), 4); // start of "bar"
@@ -891,8 +973,6 @@ mod tests {
 
     #[test]
     fn word_right_stops_at_a_word_punctuation_boundary() {
-        // Three-class model: `.` starts its own (Punctuation) run, so `E` from
-        // the start of "foo" lands on the '.', then on "bar".
         let mut b = at("foo.bar", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
         assert_eq!(head(&b), 3); // the '.'
@@ -909,8 +989,6 @@ mod tests {
 
     #[test]
     fn word_right_skips_leading_whitespace_to_next_word_start() {
-        // Whitespace is skipped: from the leading space, `E` lands on the start
-        // of "foo".
         let mut b = at(" foo", 0);
         run(&mut b, mv(WordStart(Direction::Right), false, 1));
         assert_eq!(head(&b), 1); // start of "foo"
@@ -918,8 +996,6 @@ mod tests {
 
     #[test]
     fn word_left_skips_trailing_punctuation() {
-        // Zed's first-step rule: `Q` from `bar.|` jumps to `|bar.`, stepping
-        // over the trailing punctuation rather than stopping on it.
         let mut b = at("bar.", 4);
         run(&mut b, mv(WordStart(Direction::Left), false, 1));
         assert_eq!(head(&b), 0); // start of "bar"
@@ -929,7 +1005,6 @@ mod tests {
 
     #[test]
     fn line_edges() {
-        // abc\ndef
         let mut b = at("abc\ndef", 6); // on 'f', line1
         run(&mut b, mv(LineEdge(Direction::Left), false, 1));
         assert_eq!(head(&b), 4); // line1 start
@@ -948,8 +1023,6 @@ mod tests {
 
     #[test]
     fn blank_line_down_and_up() {
-        // "aa\n\nbb": line0 "aa\n", line1 "\n" (blank), line2 "bb"
-        // bytes: a0 a1 \n2 \n3 b4 b5 ; line1 starts at byte 3
         let mut b = at("aa\n\nbb", 0);
         run(&mut b, mv(BlankLine(Direction::Down), false, 1));
         assert_eq!(head(&b), 3); // the blank line
@@ -969,10 +1042,6 @@ mod tests {
 
     #[test]
     fn blank_line_down_ignores_the_phantom_trailing_line() {
-        // A file ending in '\n' has a phantom empty last line in the rope's
-        // line model. It is not a blank line the user can see, so `]` must not
-        // jump to it — otherwise the same visible text behaves differently
-        // with/without a trailing newline.
         let mut b = at("abc\ndef\n", 0);
         run(&mut b, mv(BlankLine(Direction::Down), false, 1));
         assert_eq!(head(&b), 0); // no real blank line below -> no-op
@@ -980,7 +1049,6 @@ mod tests {
 
     #[test]
     fn blank_line_down_still_finds_a_real_trailing_blank_line() {
-        // "abc\n\n": line1 is a genuine blank line (then the phantom). `]` reaches it.
         let mut b = at("abc\n\n", 0);
         run(&mut b, mv(BlankLine(Direction::Down), false, 1));
         assert_eq!(head(&b), 4); // start of the blank line
@@ -1006,7 +1074,6 @@ mod tests {
 
     #[test]
     fn matching_bracket_across_lines() {
-        // "(\n)" : ( 0, \n 1, ) 2
         let mut b = at("(\n)", 0);
         run(&mut b, mv(MatchingBracket, false, 1));
         assert_eq!(head(&b), 2);
@@ -1021,8 +1088,6 @@ mod tests {
 
     #[test]
     fn matching_bracket_ignores_repeat_count() {
-        // Jumping to a partner is an involution; a count would just oscillate
-        // between the two ends. A count must run it once, not bounce back.
         let mut b = at("()", 0);
         run(&mut b, mv(MatchingBracket, false, 2));
         assert_eq!(head(&b), 1); // partner, not back to the start
@@ -1033,7 +1098,6 @@ mod tests {
 
     #[test]
     fn matching_bracket_from_inside_a_pair() {
-        // (abc): '('=0 a=1 b=2 c=3 ')'=4 ; cursor on 'b' (byte 2), inside the pair
         let mut b = at("(abc)", 2);
         run(&mut b, mv(MatchingBracket, false, 1));
         assert_eq!(head(&b), 4); // jumps to the enclosing pair's ')'
@@ -1047,9 +1111,10 @@ mod tests {
     fn extend_keeps_anchor_moves_head() {
         let mut b = at("abcde", 0);
         run(&mut b, mv(Char(Direction::Right), true, 1));
-        assert_eq!(b.selection.primary(), Range::new(0, 1));
+        assert_eq!(span_of(&b), (0, 1));
         run(&mut b, mv(Char(Direction::Right), true, 1));
-        assert_eq!(b.selection.primary(), Range::new(0, 2));
+        assert_eq!(span_of(&b), (0, 2));
+        assert!(!b.primary_resolved().reversed);
     }
 
     #[test]
@@ -1063,20 +1128,33 @@ mod tests {
     fn collapse_drops_span_to_head() {
         let mut b = span("abcde", 1, 4);
         run(&mut b, Action::CollapseSelection);
-        assert_eq!(b.selection.primary(), Range::cursor(4));
+        assert_eq!(head(&b), 4);
+        assert!(b.primary_resolved().is_empty());
     }
 
-    // ---- undo through the executor -------------------------------------
+    // ---- undo / redo through the executor and history ------------------
 
     #[test]
     fn undo_reverts_an_edit() {
         let mut b = at("abc", 0);
         let mut h = History::new();
         apply(Action::InsertChar('X'), &mut b, &mut h);
-        assert_eq!(b.text.to_string(), "Xabc");
+        assert_eq!(b.text(), "Xabc");
         apply(Action::Undo, &mut b, &mut h);
-        assert_eq!(b.text.to_string(), "abc");
-        assert_eq!(b.selection.primary(), Range::cursor(0));
+        assert_eq!(b.text(), "abc");
+        assert_eq!(head(&b), 0);
+    }
+
+    #[test]
+    fn redo_reapplies_an_undone_edit() {
+        let mut b = at("abc", 0);
+        let mut h = History::new();
+        apply(Action::InsertChar('X'), &mut b, &mut h);
+        apply(Action::Undo, &mut b, &mut h);
+        assert_eq!(b.text(), "abc");
+        assert!(h.redo(&mut b)); // redo is an engine capability (KEYMAP: not yet bound)
+        assert_eq!(b.text(), "Xabc");
+        assert_eq!(head(&b), 1);
     }
 
     // ---- multicursor ----------------------------------------------------
@@ -1085,7 +1163,7 @@ mod tests {
     fn two_cursors_insert_at_both() {
         let mut b = cursors("abcde", &[1, 3]);
         run(&mut b, Action::InsertChar('X'));
-        assert_eq!(b.text.to_string(), "aXbcXde");
+        assert_eq!(b.text(), "aXbcXde");
         assert_eq!(heads(&b), vec![2, 5]);
     }
 
@@ -1098,24 +1176,38 @@ mod tests {
 
     #[test]
     fn edit_that_makes_cursors_coincide_merges_them() {
-        // cursors at 1 and 2: deleting before each removes "ab" -> both land at 0
         let mut b = cursors("abc", &[1, 2]);
         run(&mut b, Action::DeleteBackward);
-        assert_eq!(b.text.to_string(), "c");
-        assert_eq!(b.selection.ranges.len(), 1);
-        assert_eq!(b.selection.primary(), Range::cursor(0));
+        assert_eq!(b.text(), "c");
+        assert_eq!(count(&b), 1);
+        assert_eq!(head(&b), 0);
     }
 
     #[test]
     fn esc_collapses_multicursor_to_the_primary() {
         let mut b = Buffer::from_str("abcde");
-        b.selection = Selection {
-            ranges: vec![Range::new(1, 2), Range::new(3, 4)],
-            primary: 1,
-        };
+        b.set_selections(
+            vec![
+                Selection {
+                    id: 0,
+                    start: 1,
+                    end: 2,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+                Selection {
+                    id: 1,
+                    start: 3,
+                    end: 4,
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                },
+            ],
+            1,
+        );
         run(&mut b, Action::CollapseSelection);
-        assert_eq!(b.selection.ranges.len(), 1);
-        assert_eq!(b.selection.primary(), Range::cursor(4)); // primary head
+        assert_eq!(count(&b), 1);
+        assert_eq!(head(&b), 4); // primary head
     }
 
     #[test]
@@ -1140,14 +1232,13 @@ mod tests {
     fn spawn_cursor_noop_at_buffer_edge() {
         let mut b = at("abc", 1); // only one line
         run(&mut b, Action::SpawnCursor(Direction::Up));
-        assert_eq!(b.selection.ranges.len(), 1);
+        assert_eq!(count(&b), 1);
     }
 
     // ---- find -----------------------------------------------------------
 
     #[test]
     fn find_moves_to_occurrence_then_repeats_both_ways() {
-        // a0 ' '1 x2 ' '3 b4 ' '5 x6 ' '7 c8
         let mut b = at("a x b x c", 0);
         let mut h = History::new();
         apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
@@ -1182,20 +1273,15 @@ mod tests {
 
     #[test]
     fn find_moves_every_cursor_and_keeps_the_multicursor() {
-        // Find is a motion; like every other motion it must move each cursor on
-        // its own line, not silently discard the secondary cursors.
-        // "axbx": a0 x1 b2 x3
         let mut b = cursors("axbx", &[0, 2]);
         let mut h = History::new();
         apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
-        assert_eq!(b.selection.ranges.len(), 2);
+        assert_eq!(count(&b), 2);
         assert_eq!(heads(&b), vec![1, 3]);
     }
 
     #[test]
     fn find_with_no_match_for_one_cursor_leaves_that_cursor_put() {
-        // "ax\ncd": cursor on line0 finds 'x'; cursor on line1 has none -> stays.
-        // a0 x1 \n2 c3 d4
         let mut b = cursors("ax\ncd", &[0, 3]);
         let mut h = History::new();
         apply(Action::FindChar { ch: 'x' }, &mut b, &mut h);
@@ -1210,18 +1296,17 @@ mod tests {
         let mut h = History::new();
 
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        assert_eq!(b.selection.primary(), Range::new(2, 4)); // "aa"
+        assert_eq!(span_of(&b), (2, 4)); // "aa"
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        let p = b.selection.primary();
-        assert_eq!((p.min(), p.max()), (2, 6)); // "aa b"
+        assert_eq!(span_of(&b), (2, 6)); // "aa b"
 
         // Ctrl+Z steps back through the expansion levels; text never changed.
         apply(Action::Undo, &mut b, &mut h);
-        let p = b.selection.primary();
-        assert_eq!((p.min(), p.max()), (2, 4));
+        assert_eq!(span_of(&b), (2, 4));
         apply(Action::Undo, &mut b, &mut h);
-        assert_eq!(b.selection.primary(), Range::cursor(2));
-        assert_eq!(b.text.to_string(), "a aa b");
+        assert_eq!(head(&b), 2);
+        assert!(b.primary_resolved().is_empty());
+        assert_eq!(b.text(), "a aa b");
     }
 
     #[test]
@@ -1230,24 +1315,30 @@ mod tests {
         let mut h = History::new();
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h); // word "abc"
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h); // outermost: no-op
-                                                                     // A second Undo would be the no-op root if the no-op did not commit.
         assert!(h.undo(&mut b)); // undoes the word selection
         assert!(!h.undo(&mut b)); // root: nothing more
     }
 
     #[test]
     fn expand_outermost_backward_selection_is_a_strict_noop() {
-        // A right-to-left selection of the whole word (reachable via Alt+Shift
-        // extend-left) must be a true no-op at the outermost level: no history
-        // entry and no orientation flip.
+        // A right-to-left whole-word selection must be a true no-op at the
+        // outermost level: no history entry and no orientation flip.
         let mut b = Buffer::from_str("abc");
-        b.selection = Selection {
-            ranges: vec![Range::new(3, 0)],
-            primary: 0,
-        };
+        let id = b.primary_id();
+        b.set_selections(
+            vec![Selection {
+                id,
+                start: 0,
+                end: 3,
+                reversed: true, // head at 0 (extended leftward)
+                goal: SelectionGoal::None,
+            }],
+            id,
+        );
         let mut h = History::new();
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        assert_eq!(b.selection.primary(), Range::new(3, 0)); // unchanged
+        assert_eq!(span_of(&b), (0, 3));
+        assert!(b.primary_resolved().reversed); // orientation unchanged
         assert!(!h.undo(&mut b)); // nothing committed: at the root
     }
 
@@ -1255,15 +1346,11 @@ mod tests {
     fn expand_normalizes_overlap_with_a_sibling_cursor() {
         // Two cursors; expanding the primary into a word swallows the sibling.
         let mut b = Buffer::from_str("a aa b");
-        b.selection = Selection {
-            ranges: vec![Range::cursor(2), Range::cursor(3)],
-            primary: 0,
-        };
+        b.set_selections(vec![Selection::cursor(0, 2), Selection::cursor(1, 3)], 0);
         let mut h = History::new();
         apply(Action::Expand(Expansion::Enclosing), &mut b, &mut h);
-        assert_eq!(b.selection.ranges.len(), 1);
-        let p = b.selection.primary();
-        assert_eq!((p.min(), p.max()), (2, 4)); // "aa"
+        assert_eq!(count(&b), 1);
+        assert_eq!(span_of(&b), (2, 4)); // "aa"
     }
 
     // ---- empty buffer ---------------------------------------------------

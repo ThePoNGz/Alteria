@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 rope = { path = "../rope" }
 sum_tree = { path = "../sum_tree" }
+text = { path = "../text" }

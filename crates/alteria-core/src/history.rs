@@ -1,46 +1,50 @@
-//! Revision-tree undo history.
+//! The undo/redo timeline — one shared stack over Zed's clock + `UndoMap`.
 //!
-//! Each undoable step is a [`Transaction`] bundling the forward edit, its
-//! inverse (for undo), and the [`Selection`] on each side. Revisions form a
-//! tree (each knows its parent and children) rather than a linear stack, so
-//! redo is a cheap later add; only the `Ctrl+Z` undo binding ships in M0.
+//! Text edits delegate their inverse to [`text::Buffer`]: each edit is a
+//! timestamped op, undo emits an undo op that flips fragment visibility in the
+//! `UndoMap`, and **real redo is undo-of-undo** (`Buffer::redo`). Selection-only
+//! expansion steps (`I`/`O`/`U`/`P`, per `KEYMAP.md`) interleave on the *same*
+//! timeline as entries that carry no text op — so `Ctrl+Z` walks back through
+//! expansions and edits alike (KEYMAP: "one shared timeline").
 //!
-//! Selection-expansion steps (`I`/`O`/`U`/`P`) commit a [`Transaction`] whose
-//! changeset is the identity but whose selections differ, so `undo` walks back
-//! through expansion steps as well as text edits — one shared timeline.
+//! Every entry stores the [`Selections`] to restore on undo (`before`) and redo
+//! (`after`). They are anchors, so once the text op is reversed they resolve to
+//! the right offsets for free.
+//!
+//! **Invariant:** the engine drives `text::Buffer` undo/redo *only* through the
+//! `Edit` entries here, in this timeline's order. Selection-only steps never
+//! touch the `text::Buffer` stacks, so the engine's `Edit` entries stay in 1:1
+//! lockstep with Zed's undo/redo stacks (undo grouping is disabled, so each edit
+//! is exactly one transaction).
 
 use crate::buffer::Buffer;
-use crate::selection::Selection;
-use crate::transaction::ChangeSet;
+use crate::selection::Selections;
+use text::TransactionId;
 
-/// One undoable step.
+/// What an undo entry does to the text. The selection is always restored.
 #[derive(Clone, Debug)]
-pub struct Transaction {
-    /// The edit as applied (post-image is reached by applying this).
-    pub forward: ChangeSet,
-    /// The inverse edit (applying it to the post-image restores the pre-image).
-    pub inverse: ChangeSet,
+enum Step {
+    /// A text transaction in the `text::Buffer` op log (undo/redo via `UndoMap`).
+    Edit(TransactionId),
+    /// A selection-only step (an expansion): no text change.
+    SelectionOnly,
+}
+
+/// One step on the shared timeline.
+#[derive(Clone, Debug)]
+struct Entry {
+    step: Step,
     /// The selection before the step (restored on undo).
-    pub selection_before: Selection,
-    /// The selection after the step (restored on redo, once bound).
-    pub selection_after: Selection,
+    before: Selections,
+    /// The selection after the step (restored on redo).
+    after: Selections,
 }
 
-/// A node in the revision tree.
-#[derive(Clone, Debug)]
-struct Revision {
-    parent: Option<usize>,
-    /// `None` only at the root.
-    transaction: Option<Transaction>,
-    /// Child revisions, newest last — redo-ready (binding deferred).
-    children: Vec<usize>,
-}
-
-/// The undo history: a tree of revisions with a cursor at the current one.
+/// The undo/redo history: two stacks of [`Entry`]s.
 #[derive(Clone, Debug)]
 pub struct History {
-    revisions: Vec<Revision>,
-    current: usize,
+    undo_stack: Vec<Entry>,
+    redo_stack: Vec<Entry>,
 }
 
 impl Default for History {
@@ -50,52 +54,71 @@ impl Default for History {
 }
 
 impl History {
-    /// A fresh history holding only the (empty) root revision.
+    /// A fresh, empty history.
     pub fn new() -> Self {
         History {
-            revisions: vec![Revision {
-                parent: None,
-                transaction: None,
-                children: Vec::new(),
-            }],
-            current: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
-    /// The current revision index (root = 0). Exposed for tests.
-    pub fn current(&self) -> usize {
-        self.current
-    }
-
-    /// Append `tx` as a child of the current revision and advance to it.
-    pub fn commit(&mut self, tx: Transaction) {
-        let new_idx = self.revisions.len();
-        let parent = self.current;
-        self.revisions[parent].children.push(new_idx);
-        self.revisions.push(Revision {
-            parent: Some(parent),
-            transaction: Some(tx),
-            children: Vec::new(),
+    /// Record a text edit. `transaction` is the id `text::Buffer::edit` produced;
+    /// `before`/`after` are the selection on each side. Clears the redo branch.
+    pub fn record_edit(
+        &mut self,
+        transaction: TransactionId,
+        before: Selections,
+        after: Selections,
+    ) {
+        self.undo_stack.push(Entry {
+            step: Step::Edit(transaction),
+            before,
+            after,
         });
-        self.current = new_idx;
+        self.redo_stack.clear();
     }
 
-    /// Undo the current revision: apply its inverse to `buf`, restore the
-    /// selection that preceded it, and move to its parent. A no-op at the root
-    /// (returns `false`); never panics.
+    /// Record a selection-only step (an expansion). Clears the redo branch.
+    pub fn record_selection(&mut self, before: Selections, after: Selections) {
+        self.undo_stack.push(Entry {
+            step: Step::SelectionOnly,
+            before,
+            after,
+        });
+        self.redo_stack.clear();
+    }
+
+    /// Step back one entry: reverse its text op (if any) and restore the
+    /// selection that preceded it. A no-op at the root (returns `false`); never
+    /// panics.
     pub fn undo(&mut self, buf: &mut Buffer) -> bool {
-        let rev = &self.revisions[self.current];
-        let (Some(parent), Some(tx)) = (rev.parent, rev.transaction.as_ref()) else {
-            return false; // at the root: nothing to undo
+        let Some(entry) = self.undo_stack.pop() else {
+            return false;
         };
-        // Clone out what we need so the borrow ends before mutating `self`.
-        let inverse = tx.inverse.clone();
-        let selection_before = tx.selection_before.clone();
-        if !inverse.apply(&mut buf.text) {
-            return false; // refuse to desync on a non-applicable inverse
+        if let Step::Edit(tx) = &entry.step {
+            // The timeline's Edit entries stay in lockstep with text::Buffer's
+            // undo stack (no grouping), so the undone transaction must match.
+            let undone = buf.undo();
+            debug_assert_eq!(undone, Some(*tx), "undo out of sync with text::Buffer");
         }
-        buf.selection = selection_before;
-        self.current = parent;
+        buf.selection = entry.before.clone();
+        self.redo_stack.push(entry);
+        true
+    }
+
+    /// Step forward one entry: re-apply its text op (if any) and restore the
+    /// selection that followed it. A no-op when nothing was undone (returns
+    /// `false`); never panics.
+    pub fn redo(&mut self, buf: &mut Buffer) -> bool {
+        let Some(entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        if let Step::Edit(tx) = &entry.step {
+            let redone = buf.redo();
+            debug_assert_eq!(redone, Some(*tx), "redo out of sync with text::Buffer");
+        }
+        buf.selection = entry.after.clone();
+        self.undo_stack.push(entry);
         true
     }
 }
@@ -103,27 +126,34 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selection::Range;
-    use rope::Rope;
 
-    /// Build an edit transaction the way the executor will: forward changeset,
-    /// its inverse against the pre-image, and the two selections.
-    fn edit_tx(
-        before: &Rope,
-        from: usize,
-        to: usize,
-        ins: &str,
-        sel_before: Selection,
-        sel_after: Selection,
-    ) -> Transaction {
-        let forward = ChangeSet::from_changes(before.len(), &[(from, to, ins.to_string())]);
-        let inverse = forward.invert(before);
-        Transaction {
-            forward,
-            inverse,
-            selection_before: sel_before,
-            selection_after: sel_after,
-        }
+    /// Drive an edit the way the executor does: snapshot the selection, apply
+    /// the edit, move the caret, then record the (before, after) pair.
+    fn typed(buf: &mut Buffer, history: &mut History, range: std::ops::Range<usize>, s: &str) {
+        let before = buf.selection.clone();
+        let caret = range.start + s.len();
+        let tx = buf.edit(vec![(range, s.to_string())]);
+        buf.set_cursor(caret);
+        let after = buf.selection.clone();
+        history.record_edit(tx.expect("edit produced a transaction"), before, after);
+    }
+
+    /// Drive a selection-only step (an expansion): record (before, after) with
+    /// no text change.
+    fn expanded(buf: &mut Buffer, history: &mut History, start: usize, end: usize) {
+        let before = buf.selection.clone();
+        buf.set_selections(
+            vec![crate::selection::Selection {
+                id: buf.primary_id(),
+                start,
+                end,
+                reversed: false,
+                goal: crate::selection::SelectionGoal::None,
+            }],
+            buf.primary_id(),
+        );
+        let after = buf.selection.clone();
+        history.record_selection(before, after);
     }
 
     #[test]
@@ -131,72 +161,100 @@ mod tests {
         let mut h = History::new();
         let mut buf = Buffer::from_str("abc");
         assert!(!h.undo(&mut buf));
-        assert_eq!(buf.text.to_string(), "abc");
-        assert_eq!(h.current(), 0);
+        assert_eq!(buf.text(), "abc");
+        assert!(!h.redo(&mut buf));
     }
 
     #[test]
     fn undo_reverts_an_insert_and_restores_selection() {
         let mut buf = Buffer::from_str("abc");
-        let before = buf.text.clone();
-        let tx = edit_tx(&before, 0, 0, "X", Selection::at(0), Selection::at(1));
-        // Apply the edit (as the executor would) and advance the cursor.
-        tx.forward.apply(&mut buf.text);
-        buf.selection = Selection::at(1);
-
         let mut h = History::new();
-        h.commit(tx);
-        assert_eq!(buf.text.to_string(), "Xabc");
+        typed(&mut buf, &mut h, 0..0, "X");
+        assert_eq!(buf.text(), "Xabc");
+        assert_eq!(buf.primary_resolved().head(), 1);
 
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text.to_string(), "abc");
-        assert_eq!(buf.selection, Selection::at(0));
-        assert_eq!(h.current(), 0);
+        assert_eq!(buf.text(), "abc");
+        assert_eq!(buf.primary_resolved().head(), 0);
     }
 
     #[test]
-    fn multiple_edits_undo_in_reverse_order() {
+    fn redo_reapplies_text_and_selection() {
+        let mut buf = Buffer::from_str("abc");
+        let mut h = History::new();
+        typed(&mut buf, &mut h, 0..0, "X");
+        h.undo(&mut buf);
+        assert_eq!(buf.text(), "abc");
+
+        assert!(h.redo(&mut buf));
+        assert_eq!(buf.text(), "Xabc");
+        assert_eq!(buf.primary_resolved().head(), 1);
+        // Nothing left to redo.
+        assert!(!h.redo(&mut buf));
+    }
+
+    #[test]
+    fn multiple_edits_undo_and_redo_in_order() {
         let mut buf = Buffer::from_str("ab");
         let mut h = History::new();
+        typed(&mut buf, &mut h, 0..0, "X"); // "Xab"
+        typed(&mut buf, &mut h, 3..3, "Y"); // "XabY"
+        assert_eq!(buf.text(), "XabY");
 
-        let b1 = buf.text.clone();
-        let t1 = edit_tx(&b1, 0, 0, "X", Selection::at(0), Selection::at(1));
-        t1.forward.apply(&mut buf.text);
-        h.commit(t1);
-
-        let b2 = buf.text.clone(); // "Xab"
-        let t2 = edit_tx(&b2, 3, 3, "Y", Selection::at(3), Selection::at(4));
-        t2.forward.apply(&mut buf.text);
-        h.commit(t2);
-
-        assert_eq!(buf.text.to_string(), "XabY");
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text.to_string(), "Xab");
+        assert_eq!(buf.text(), "Xab");
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text.to_string(), "ab");
-        assert!(!h.undo(&mut buf)); // back at root
+        assert_eq!(buf.text(), "ab");
+        assert!(!h.undo(&mut buf)); // root
+
+        assert!(h.redo(&mut buf));
+        assert_eq!(buf.text(), "Xab");
+        assert!(h.redo(&mut buf));
+        assert_eq!(buf.text(), "XabY");
     }
 
     #[test]
     fn expansion_step_undo_restores_selection_without_changing_text() {
         let mut buf = Buffer::from_str("hello");
-        let expanded = Selection {
-            ranges: vec![Range::new(0, 5)],
-            primary: 0,
-        };
-        buf.selection = expanded.clone();
-
-        let id = ChangeSet::identity(5);
         let mut h = History::new();
-        h.commit(Transaction {
-            forward: id.clone(),
-            inverse: id,
-            selection_before: Selection::at(2),
-            selection_after: expanded,
-        });
+        buf.set_cursor(2);
+        expanded(&mut buf, &mut h, 0, 5); // "select" the whole word, text untouched
+        assert_eq!(
+            (buf.primary_resolved().min(), buf.primary_resolved().max()),
+            (0, 5)
+        );
 
         assert!(h.undo(&mut buf));
-        assert_eq!(buf.text.to_string(), "hello"); // text untouched
-        assert_eq!(buf.selection, Selection::at(2)); // selection reverted
+        assert_eq!(buf.text(), "hello"); // text untouched
+        assert_eq!(buf.primary_resolved().head(), 2); // selection reverted
+
+        assert!(h.redo(&mut buf));
+        assert_eq!(
+            (buf.primary_resolved().min(), buf.primary_resolved().max()),
+            (0, 5)
+        );
+    }
+
+    #[test]
+    fn edits_and_expansions_share_one_timeline() {
+        // expand (selection-only) then type over it: undo walks back through both.
+        let mut buf = Buffer::from_str("foo");
+        let mut h = History::new();
+        expanded(&mut buf, &mut h, 0, 3); // select "foo"
+        typed(&mut buf, &mut h, 0..3, "x"); // replace -> "x"
+        assert_eq!(buf.text(), "x");
+
+        assert!(h.undo(&mut buf)); // undo the edit: text back, expanded span restored
+        assert_eq!(buf.text(), "foo");
+        assert_eq!(
+            (buf.primary_resolved().min(), buf.primary_resolved().max()),
+            (0, 3)
+        );
+
+        assert!(h.undo(&mut buf)); // undo the expansion: selection collapses
+        assert_eq!(buf.text(), "foo");
+        assert_eq!(buf.primary_resolved().head(), 0);
+
+        assert!(!h.undo(&mut buf)); // root
     }
 }
