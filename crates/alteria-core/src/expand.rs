@@ -16,27 +16,25 @@
 //!   delimiters, then the parent's content, then the parent pair, … out.
 //!
 //! Everything is in **byte** offsets, matching the byte-indexed [`rope::Rope`]
-//! and the byte offsets a [`Range`] stores — no char-index bridge. Positions
-//! step by char boundaries via [`next_boundary`]/[`prev_boundary`].
+//! — no char-index bridge. The selection layer owns anchors; expansion works in
+//! plain offset space (`lo`/`hi`) and the executor re-anchors the result.
+//! Positions step by char boundaries via [`next_boundary`]/[`prev_boundary`].
 
 use rope::Rope;
 
 use crate::action::Expansion;
 use crate::char_kind::{char_kind, CharKind};
-use crate::selection::Range;
 
-/// Expand `range` one level according to `kind`. Returns `range` unchanged when
-/// already at the outermost level (the executor treats that as a no-op).
-pub fn expand(text: &Rope, range: Range, kind: Expansion) -> Range {
-    let lo = range.min();
-    let hi = range.max();
-    let (nlo, nhi) = match kind {
+/// Expand the span `[lo, hi)` one level according to `kind`, returning the new
+/// `(lo, hi)`. Returns the span unchanged when already at the outermost level
+/// (the executor treats that as a no-op).
+pub fn expand(text: &Rope, lo: usize, hi: usize, kind: Expansion) -> (usize, usize) {
+    match kind {
         Expansion::Enclosing => enclosing(text, lo, hi, false),
         Expansion::EnclosingLeft => enclosing(text, lo, hi, true),
         Expansion::BracketContent => bracket_content(text, lo, hi),
         Expansion::BracketAlternating => bracket_alternating(text, lo, hi),
-    };
-    Range::new(nlo, nhi)
+    }
 }
 
 /// A word character — routed through the engine's shared [`char_kind`]
@@ -276,79 +274,75 @@ mod tests {
     use super::*;
     use crate::action::Expansion::*;
 
-    fn rng(anchor: usize, head: usize) -> Range {
-        Range::new(anchor, head)
-    }
-    /// Expand once and return the resulting span as `(min, max)` byte offsets.
-    fn ex(text: &str, range: Range, kind: Expansion) -> (usize, usize) {
-        let r = expand(&Rope::from(text), range, kind);
-        (r.min(), r.max())
+    /// Expand once and return the resulting span as `(lo, hi)` byte offsets.
+    fn ex(text: &str, lo: usize, hi: usize, kind: Expansion) -> (usize, usize) {
+        expand(&Rope::from(text), lo, hi, kind)
     }
 
     #[test]
     fn i_selects_word_then_grows_right() {
         let t = "a aa b"; // cursor in "aa" (byte 2)
-        assert_eq!(ex(t, Range::cursor(2), Enclosing), (2, 4)); // "aa"
-        assert_eq!(ex(t, rng(2, 4), Enclosing), (2, 6)); // "aa b"
+        assert_eq!(ex(t, 2, 2, Enclosing), (2, 4)); // "aa"
+        assert_eq!(ex(t, 2, 4, Enclosing), (2, 6)); // "aa b"
     }
 
     #[test]
     fn u_selects_word_then_grows_left() {
         let t = "a aa b";
-        assert_eq!(ex(t, Range::cursor(2), EnclosingLeft), (2, 4)); // "aa"
-        assert_eq!(ex(t, rng(2, 4), EnclosingLeft), (0, 4)); // "a aa"
+        assert_eq!(ex(t, 2, 2, EnclosingLeft), (2, 4)); // "aa"
+        assert_eq!(ex(t, 2, 4, EnclosingLeft), (0, 4)); // "a aa"
     }
 
     #[test]
     fn i_climbs_into_enclosing_bracket_pair() {
         let t = "(a aa b)";
         // content fully selected -> the pair including its delimiters
-        assert_eq!(ex(t, rng(1, 7), Enclosing), (0, 8));
+        assert_eq!(ex(t, 1, 7, Enclosing), (0, 8));
     }
 
     #[test]
     fn i_word_then_noop_in_plain_text() {
         let t = "abc";
-        assert_eq!(ex(t, Range::cursor(1), Enclosing), (0, 3)); // word
-        assert_eq!(ex(t, rng(0, 3), Enclosing), (0, 3)); // outermost: no-op
+        assert_eq!(ex(t, 1, 1, Enclosing), (0, 3)); // word
+        assert_eq!(ex(t, 0, 3, Enclosing), (0, 3)); // outermost: no-op
     }
 
     #[test]
     fn i_climbs_through_nested_brackets() {
         let t = "[(x)]";
-        assert_eq!(ex(t, Range::cursor(2), Enclosing), (2, 3)); // word "x"
-        assert_eq!(ex(t, rng(2, 3), Enclosing), (1, 4)); // inner pair "(x)"
-        assert_eq!(ex(t, rng(1, 4), Enclosing), (0, 5)); // outer pair "[(x)]"
+        assert_eq!(ex(t, 2, 2, Enclosing), (2, 3)); // word "x"
+        assert_eq!(ex(t, 2, 3, Enclosing), (1, 4)); // inner pair "(x)"
+        assert_eq!(ex(t, 1, 4, Enclosing), (0, 5)); // outer pair "[(x)]"
     }
 
     #[test]
     fn o_climbs_bracket_content() {
         let t = "((x))";
-        assert_eq!(ex(t, Range::cursor(2), BracketContent), (2, 3)); // "x"
-        assert_eq!(ex(t, rng(2, 3), BracketContent), (1, 4)); // "(x)"
-        assert_eq!(ex(t, rng(1, 4), BracketContent), (1, 4)); // outermost: no-op
+        assert_eq!(ex(t, 2, 2, BracketContent), (2, 3)); // "x"
+        assert_eq!(ex(t, 2, 3, BracketContent), (1, 4)); // "(x)"
+        assert_eq!(ex(t, 1, 4, BracketContent), (1, 4)); // outermost: no-op
     }
 
     #[test]
     fn o_matches_across_lines() {
         let t = "(\nx\n)"; // ( \n x \n ) -> bytes 0..5
-        assert_eq!(ex(t, Range::cursor(2), BracketContent), (1, 4)); // "\nx\n"
+        assert_eq!(ex(t, 2, 2, BracketContent), (1, 4)); // "\nx\n"
     }
 
     #[test]
     fn p_alternates_content_then_pair() {
         let t = "(a)";
-        assert_eq!(ex(t, Range::cursor(1), BracketAlternating), (1, 2)); // "a"
-        assert_eq!(ex(t, rng(1, 2), BracketAlternating), (0, 3)); // "(a)"
-        assert_eq!(ex(t, rng(0, 3), BracketAlternating), (0, 3)); // no-op
+        assert_eq!(ex(t, 1, 1, BracketAlternating), (1, 2)); // "a"
+        assert_eq!(ex(t, 1, 2, BracketAlternating), (0, 3)); // "(a)"
+        assert_eq!(ex(t, 0, 3, BracketAlternating), (0, 3)); // no-op
     }
 
     #[test]
     fn p_nested_skips_the_coinciding_level() {
         let t = "((x))";
-        assert_eq!(ex(t, Range::cursor(2), BracketAlternating), (2, 3)); // "x"
-        assert_eq!(ex(t, rng(2, 3), BracketAlternating), (1, 4)); // "(x)" pair
-        assert_eq!(ex(t, rng(1, 4), BracketAlternating), (0, 5)); // "((x))" pair
-        assert_eq!(ex(t, rng(0, 5), BracketAlternating), (0, 5)); // no-op
+        assert_eq!(ex(t, 2, 2, BracketAlternating), (2, 3)); // "x"
+        assert_eq!(ex(t, 2, 3, BracketAlternating), (1, 4)); // "(x)" pair
+        assert_eq!(ex(t, 1, 4, BracketAlternating), (0, 5)); // "((x))" pair
+        assert_eq!(ex(t, 0, 5, BracketAlternating), (0, 5)); // no-op
     }
 }

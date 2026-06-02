@@ -5,7 +5,9 @@
 //! `InputEvent -> Resolver -> Action -> Executor -> Buffer` pipeline is a pure
 //! function over plain data, fully unit-testable without a window.
 //!
-//! The single entry point a frontend uses is [`Editor`]: feed it raw
+//! The buffer, anchors, undo/redo (Lamport clock + `UndoMap`), and selections
+//! are Zed's `text` model, vendored from `zed-industries/zed`. The single entry
+//! point a frontend uses is [`Editor`]: feed it raw
 //! [`InputEvent`](input::InputEvent)s and read [`Editor::buffer`] to render.
 
 pub mod action;
@@ -19,7 +21,6 @@ pub mod input;
 pub mod keymap;
 pub mod resolver;
 pub mod selection;
-pub mod transaction;
 
 use buffer::Buffer;
 use history::History;
@@ -69,7 +70,6 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::input::{Key, Modifiers};
-    use crate::selection::Range;
 
     const ALT: Modifiers = Modifiers {
         alt: true,
@@ -114,7 +114,11 @@ mod tests {
             });
         }
         fn head(&self) -> usize {
-            self.buffer.selection.primary().head
+            self.buffer.primary_resolved().head()
+        }
+        fn span(&self) -> (usize, usize) {
+            let p = self.buffer.primary_resolved();
+            (p.min(), p.max())
         }
     }
 
@@ -128,7 +132,7 @@ mod tests {
         assert_eq!(e.head(), 1);
         e.release();
         assert!(e.key('x', Modifiers::NONE)); // type at the navigated spot
-        assert_eq!(e.buffer.text.to_string(), "axb");
+        assert_eq!(e.buffer.text(), "axb");
         assert_eq!(e.head(), 2);
     }
 
@@ -138,7 +142,8 @@ mod tests {
         e.hold(ALT_SHIFT);
         e.key('d', ALT_SHIFT);
         e.key('d', ALT_SHIFT);
-        assert_eq!(e.buffer.selection.primary(), Range::new(0, 2));
+        assert_eq!(e.span(), (0, 2));
+        assert!(!e.buffer.primary_resolved().reversed);
     }
 
     #[test]
@@ -173,11 +178,9 @@ mod tests {
         e.key('d', ALT); // cursor at 2
         assert_eq!(e.head(), 2);
         e.key('i', ALT); // expand to word "aa"
-        let p = e.buffer.selection.primary();
-        assert_eq!((p.min(), p.max()), (2, 4));
+        assert_eq!(e.span(), (2, 4));
         e.key('i', ALT); // grow right to "aa b"
-        let p = e.buffer.selection.primary();
-        assert_eq!((p.min(), p.max()), (2, 6));
+        assert_eq!(e.span(), (2, 6));
     }
 
     #[test]
@@ -186,9 +189,9 @@ mod tests {
         e.hold(ALT_CTRL);
         e.key('s', ALT_CTRL); // spawn a cursor on the line below
         e.release();
-        assert_eq!(e.buffer.selection.ranges.len(), 2);
+        assert_eq!(e.buffer.selection.selections.len(), 2);
         e.key('X', Modifiers::NONE); // type once -> both cursors get it
-        assert_eq!(e.buffer.text.to_string(), "Xab\nXcd");
+        assert_eq!(e.buffer.text(), "Xab\nXcd");
     }
 
     #[test]
@@ -198,29 +201,24 @@ mod tests {
         e.hold(ALT);
         e.key('i', ALT); // select "foo"
         e.release();
-        assert_eq!(
-            {
-                let p = e.buffer.selection.primary();
-                (p.min(), p.max())
-            },
-            (0, 3)
-        );
+        assert_eq!(e.span(), (0, 3));
+
         e.key('x', Modifiers::NONE); // typing replaces the selection -> "x"
-        assert_eq!(e.buffer.text.to_string(), "x");
+        assert_eq!(e.buffer.text(), "x");
         assert_eq!(e.head(), 1);
 
         // Ctrl+Z undoes the edit (text + selection)...
         e.hold(CTRL);
         e.key('z', CTRL);
-        assert_eq!(e.buffer.text.to_string(), "foo");
-        let p = e.buffer.selection.primary();
-        assert_eq!((p.min(), p.max()), (0, 3)); // the expansion span is restored
+        assert_eq!(e.buffer.text(), "foo");
+        assert_eq!(e.span(), (0, 3)); // the expansion span is restored
 
         // ...and again undoes the expansion step (selection only).
         e.key('z', CTRL);
         e.release();
-        assert_eq!(e.buffer.text.to_string(), "foo");
-        assert_eq!(e.buffer.selection.primary(), Range::cursor(0));
+        assert_eq!(e.buffer.text(), "foo");
+        assert_eq!(e.head(), 0);
+        assert!(e.buffer.primary_resolved().is_empty());
     }
 
     #[test]

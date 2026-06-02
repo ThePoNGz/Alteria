@@ -1,132 +1,264 @@
-//! The selection model: byte-offset ranges, multicursor-ready.
+//! The selection model: Zed's `Selection<T>` shape over byte-true [`Anchor`]s.
 //!
-//! Every cursor is a [`Range`] of byte offsets. `anchor == head` is a bare
-//! cursor (no span selected); otherwise the half-open span between them is
-//! selected. A [`Selection`] is a non-empty set of ranges with one primary.
+//! Adopts Zed's `text::Selection<T> { id, start, end, reversed, goal }` shape
+//! (`crates/text/src/selection.rs`): `start <= end` always, and `reversed`
+//! records which end is the moving **head** (`reversed` ⇒ head at `start`).
+//! `start == end` is a bare cursor. Positions are stored as **`Anchor`s** so a
+//! selection rides edits made elsewhere for free; an action resolves them to
+//! byte offsets against a [`BufferSnapshot`], does its math in offset space
+//! (reusing the motion layer), then re-anchors.
+//!
+//! [`SelectionGoal`] mirrors the shape of Zed's enum but carries only the
+//! **byte-column** variant Alteria needs (plan 003): rope columns are bytes and
+//! pixel-x goals are deferred to the frontend.
+//!
+//! A [`Selections`] is the multicursor wrapper — `Vec<Selection<Anchor>>` with a
+//! stable `primary` id. One edit applies to every selection; motions move every
+//! head.
 
-/// A single cursor or selection span, as byte offsets into the buffer.
-///
-/// `anchor` is the fixed end (where a selection was initiated); `head` is the
-/// moving end. The span is `[min, max)`. `anchor == head` is a bare cursor.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Range {
-    pub anchor: usize,
-    pub head: usize,
-    /// The remembered visual column for vertical motion (Zed's
-    /// `SelectionGoal::Column`). `Some(col)` lets up/down keep their column
-    /// across short lines; it is `None` until a vertical motion sets it and is
-    /// reset by horizontal motion and edits. A *byte* column (rope columns are
-    /// bytes); pixel-x goals are deferred to the frontend.
-    pub goal: Option<u32>,
+use text::Anchor;
+
+/// The remembered goal for vertical motion (Zed's `SelectionGoal`). Only the
+/// byte-`Column` variant is modelled; rope columns are bytes and pixel-x goals
+/// are the frontend's concern (plan 003).
+#[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SelectionGoal {
+    /// No goal — seed it from the current column on the next vertical motion.
+    #[default]
+    None,
+    /// Keep this byte column across short lines.
+    Column(u32),
 }
 
-impl Range {
-    /// A bare cursor at `pos` (`anchor == head == pos`), with no goal column.
-    pub fn cursor(pos: usize) -> Self {
-        Range {
-            anchor: pos,
-            head: pos,
-            goal: None,
+impl SelectionGoal {
+    /// The goal as an optional byte column, for the offset-space motion helpers.
+    pub fn column(self) -> Option<u32> {
+        match self {
+            SelectionGoal::None => None,
+            SelectionGoal::Column(c) => Some(c),
         }
     }
 
-    /// A range from `anchor` to `head` with no goal column. The terse
-    /// constructor existing call sites use, so adding `goal` doesn't force every
-    /// `Range { .. }` literal to spell the field out.
-    pub fn new(anchor: usize, head: usize) -> Self {
-        Range {
-            anchor,
-            head,
-            goal: None,
-        }
-    }
-
-    /// True when nothing is selected (`anchor == head`).
-    pub fn is_empty(&self) -> bool {
-        self.anchor == self.head
-    }
-
-    /// The lower bound of the span.
-    pub fn min(&self) -> usize {
-        self.anchor.min(self.head)
-    }
-
-    /// The upper bound of the span.
-    pub fn max(&self) -> usize {
-        self.anchor.max(self.head)
-    }
-
-    /// True when the two ranges share a position and should merge.
+    /// Build a goal from an optional byte column (the inverse of [`column`]).
     ///
-    /// Two bare cursors at the same offset overlap; a cursor exactly at the
-    /// far edge of a span does not (it is a distinct position). Spans overlap
-    /// only when they share interior — touching end-to-start does not merge.
-    pub fn overlaps(&self, other: &Range) -> bool {
-        self.min() == other.min() || (self.max() > other.min() && other.max() > self.min())
+    /// [`column`]: SelectionGoal::column
+    pub fn from_column(col: Option<u32>) -> Self {
+        match col {
+            Some(c) => SelectionGoal::Column(c),
+            None => SelectionGoal::None,
+        }
     }
 }
 
-/// A set of one or more ranges, one of which is primary. One edit applies to
-/// every range; motions move every head.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Selection {
-    pub ranges: Vec<Range>,
-    pub primary: usize,
+/// A single cursor or selection span (Zed's `Selection<T>` shape).
+///
+/// `start <= end` always; `reversed` marks which end is the moving head. `T` is
+/// [`Anchor`] in storage and `usize` (byte offset) in the resolved working form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection<T> {
+    /// A stable identity, so a selection can be tracked through motions, edits,
+    /// and merges (Zed assigns each selection an id).
+    pub id: usize,
+    /// The lower end of the span.
+    pub start: T,
+    /// The upper end of the span.
+    pub end: T,
+    /// `true` when the head is at `start` (the selection was extended leftward).
+    pub reversed: bool,
+    /// The vertical-motion goal carried with the head.
+    pub goal: SelectionGoal,
 }
 
-impl Selection {
-    /// A single bare cursor at `pos`.
-    pub fn at(pos: usize) -> Self {
+impl<T: Copy> Selection<T> {
+    /// The moving end (the cursor).
+    pub fn head(&self) -> T {
+        if self.reversed {
+            self.start
+        } else {
+            self.end
+        }
+    }
+
+    /// The fixed end (the anchor the head moved away from).
+    pub fn tail(&self) -> T {
+        if self.reversed {
+            self.end
+        } else {
+            self.start
+        }
+    }
+}
+
+impl Selection<usize> {
+    /// A bare cursor at `pos` with id `id` and no goal.
+    pub fn cursor(id: usize, pos: usize) -> Self {
         Selection {
-            ranges: vec![Range::cursor(pos)],
-            primary: 0,
+            id,
+            start: pos,
+            end: pos,
+            reversed: false,
+            goal: SelectionGoal::None,
         }
     }
 
-    /// The primary range — the one motions/edits report against.
-    pub fn primary(&self) -> Range {
-        self.ranges[self.primary]
+    /// True when nothing is selected (`start == end`).
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 
-    /// Sort ranges by position, merge overlaps, and keep `primary` pointing at
-    /// the (possibly merged) range that contains the old primary. A merged
-    /// range is normalized to forward orientation (M0 simplification).
-    pub fn normalize(&mut self) {
-        if self.ranges.len() <= 1 {
-            return;
+    /// The lower bound of the span (`start`, since `start <= end`).
+    pub fn min(&self) -> usize {
+        self.start
+    }
+
+    /// The upper bound of the span (`end`).
+    pub fn max(&self) -> usize {
+        self.end
+    }
+
+    /// Move the head to `head`, keeping the tail fixed, and set the new goal —
+    /// reordering `start`/`end` and flipping `reversed` as needed (Zed
+    /// `Selection::set_head`).
+    pub fn set_head(&mut self, head: usize, goal: SelectionGoal) {
+        let tail = self.tail();
+        if head >= tail {
+            self.start = tail;
+            self.end = head;
+            self.reversed = false;
+        } else {
+            self.start = head;
+            self.end = tail;
+            self.reversed = true;
         }
-        let primary = self.ranges[self.primary];
+        self.goal = goal;
+    }
+}
 
-        let mut sorted = self.ranges.clone();
-        sorted.sort_by_key(|r| (r.min(), r.max()));
+/// Sort `selections` by position and merge any that overlap, returning the
+/// surviving id for the selection that carried `primary_id` (or the range that
+/// swallowed it). A merged span is normalized to forward orientation with no
+/// goal (an M0 simplification, matching the pre-anchor model); standalone
+/// selections keep their orientation, id, and goal.
+///
+/// Operates in **offset space** (`Selection<usize>`) because anchors only order
+/// against a snapshot; the caller resolves first, then re-anchors the result.
+pub fn normalize(selections: &mut Vec<Selection<usize>>, primary_id: usize) -> usize {
+    if selections.len() <= 1 {
+        return primary_id;
+    }
+    // The span the old primary covered, to re-find it after merging.
+    let primary_span = selections
+        .iter()
+        .find(|s| s.id == primary_id)
+        .map(|s| (s.min(), s.max()));
 
-        let mut merged: Vec<Range> = Vec::with_capacity(sorted.len());
-        for r in sorted {
-            match merged.last_mut() {
-                Some(last) if last.overlaps(&r) => {
-                    let new_min = last.min().min(r.min());
-                    let new_max = last.max().max(r.max());
-                    *last = Range::new(new_min, new_max);
-                }
-                _ => merged.push(r),
+    selections.sort_by_key(|s| (s.min(), s.max()));
+
+    let mut merged: Vec<Selection<usize>> = Vec::with_capacity(selections.len());
+    for s in selections.drain(..) {
+        match merged.last_mut() {
+            Some(last) if overlaps(last, &s) => {
+                // Grow the survivor to the union and keep it forward; prefer the
+                // primary's id so the merged range stays primary if it ate it.
+                let new_min = last.min().min(s.min());
+                let new_max = last.max().max(s.max());
+                let keep_id = if s.id == primary_id { s.id } else { last.id };
+                last.id = keep_id;
+                last.start = new_min;
+                last.end = new_max;
+                last.reversed = false;
+                last.goal = SelectionGoal::None;
             }
+            _ => merged.push(s),
         }
+    }
 
-        // Keep the primary: prefer the surviving identical range (so a bare
-        // cursor sharing an edge with a span isn't reassigned to the span), and
-        // only fall back to containment for a primary that was merged away.
-        let new_primary = merged
-            .iter()
-            .position(|r| *r == primary)
-            .or_else(|| {
+    // Keep the primary: prefer the surviving identical id, else the range that
+    // now contains the old primary's span, else the first.
+    let new_primary = merged
+        .iter()
+        .find(|s| s.id == primary_id)
+        .map(|s| s.id)
+        .or_else(|| {
+            primary_span.and_then(|(lo, hi)| {
                 merged
                     .iter()
-                    .position(|r| r.min() <= primary.min() && primary.max() <= r.max())
+                    .find(|s| s.min() <= lo && hi <= s.max())
+                    .map(|s| s.id)
             })
-            .unwrap_or(0);
+        })
+        .unwrap_or_else(|| merged[0].id);
 
-        self.ranges = merged;
-        self.primary = new_primary;
+    *selections = merged;
+    new_primary
+}
+
+/// True when two resolved selections share a position and should merge: two
+/// bare cursors coincide, or two spans share interior. Touching end-to-start
+/// does not merge; a bare cursor on a span's far edge is a distinct position.
+fn overlaps(a: &Selection<usize>, b: &Selection<usize>) -> bool {
+    a.min() == b.min() || (a.max() > b.min() && b.max() > a.min())
+}
+
+/// The multicursor set: anchored selections with one stable primary.
+///
+/// Anchors are resolved to offsets at the start of an action and rebuilt from
+/// offsets at the end (see `buffer`), so this type stays a plain container —
+/// all ordering/merging happens in offset space via [`normalize`].
+#[derive(Clone, Debug)]
+pub struct Selections {
+    /// Every cursor/span, kept sorted and non-overlapping after each action.
+    pub selections: Vec<Selection<Anchor>>,
+    /// The id of the primary selection (the one motions/edits report against).
+    primary_id: usize,
+    /// The next id to hand out, so every selection gets a unique stable id.
+    next_id: usize,
+}
+
+impl Selections {
+    /// A set holding the single anchored `cursor`, made primary.
+    pub fn single(cursor: Selection<Anchor>) -> Self {
+        let primary_id = cursor.id;
+        Selections {
+            selections: vec![cursor],
+            primary_id,
+            next_id: primary_id + 1,
+        }
+    }
+
+    /// The primary selection (falls back to the first if the id went missing).
+    pub fn primary(&self) -> &Selection<Anchor> {
+        self.selections
+            .iter()
+            .find(|s| s.id == self.primary_id)
+            .unwrap_or(&self.selections[0])
+    }
+
+    /// The id of the primary selection.
+    pub fn primary_id(&self) -> usize {
+        self.primary_id
+    }
+
+    /// Hand out a fresh, unique selection id (for spawning a cursor).
+    pub fn alloc_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Replace the anchored selections wholesale (after re-anchoring), recording
+    /// the new primary id. `next_id` is preserved so ids stay unique.
+    pub fn replace(&mut self, selections: Vec<Selection<Anchor>>, primary_id: usize) {
+        debug_assert!(!selections.is_empty(), "a Selections is never empty");
+        self.next_id = self.next_id.max(
+            selections
+                .iter()
+                .map(|s| s.id + 1)
+                .max()
+                .unwrap_or(self.next_id),
+        );
+        self.selections = selections;
+        self.primary_id = primary_id;
     }
 }
 
@@ -134,122 +266,103 @@ impl Selection {
 mod tests {
     use super::*;
 
+    fn sel(id: usize, start: usize, end: usize, reversed: bool) -> Selection<usize> {
+        Selection {
+            id,
+            start,
+            end,
+            reversed,
+            goal: SelectionGoal::None,
+        }
+    }
+
     #[test]
-    fn bare_cursor_is_empty() {
-        let c = Range::cursor(4);
+    fn head_and_tail_follow_reversed() {
+        let forward = sel(0, 2, 7, false);
+        assert_eq!((forward.tail(), forward.head()), (2, 7));
+        let backward = sel(0, 2, 7, true);
+        assert_eq!((backward.tail(), backward.head()), (7, 2));
+    }
+
+    #[test]
+    fn cursor_is_empty() {
+        let c = Selection::cursor(0, 4);
         assert!(c.is_empty());
-        assert_eq!(c.min(), 4);
-        assert_eq!(c.max(), 4);
+        assert_eq!((c.min(), c.max()), (4, 4));
     }
 
     #[test]
-    fn min_max_independent_of_orientation() {
-        let forward = Range::new(2, 7);
-        let backward = Range::new(7, 2);
-        assert_eq!((forward.min(), forward.max()), (2, 7));
-        assert_eq!((backward.min(), backward.max()), (2, 7));
-        assert!(!forward.is_empty());
-        assert!(!backward.is_empty());
+    fn set_head_extends_forward_then_flips_backward() {
+        let mut s = Selection::cursor(0, 3);
+        s.set_head(5, SelectionGoal::None);
+        assert_eq!((s.start, s.end, s.reversed), (3, 5, false));
+        // Pull the head back past the tail: the orientation flips.
+        s.set_head(1, SelectionGoal::None);
+        assert_eq!((s.start, s.end, s.reversed), (1, 3, true));
     }
 
     #[test]
-    fn identical_cursors_overlap() {
-        assert!(Range::cursor(3).overlaps(&Range::cursor(3)));
+    fn set_head_records_goal() {
+        let mut s = Selection::cursor(0, 0);
+        s.set_head(2, SelectionGoal::Column(9));
+        assert_eq!(s.goal, SelectionGoal::Column(9));
     }
 
     #[test]
-    fn distinct_cursors_do_not_overlap() {
-        assert!(!Range::cursor(3).overlaps(&Range::cursor(5)));
+    fn goal_round_trips_through_column() {
+        assert_eq!(
+            SelectionGoal::from_column(Some(7)),
+            SelectionGoal::Column(7)
+        );
+        assert_eq!(SelectionGoal::Column(7).column(), Some(7));
+        assert_eq!(SelectionGoal::None.column(), None);
+        assert_eq!(SelectionGoal::from_column(None), SelectionGoal::None);
     }
 
     #[test]
-    fn interior_overlapping_spans_overlap() {
-        let a = Range::new(0, 3);
-        let b = Range::new(2, 5);
-        assert!(a.overlaps(&b));
-        assert!(b.overlaps(&a));
+    fn normalize_single_is_noop() {
+        let mut v = vec![sel(0, 7, 2, false)];
+        assert_eq!(normalize(&mut v, 0), 0);
+        assert_eq!(v.len(), 1);
     }
 
     #[test]
-    fn touching_spans_do_not_overlap() {
-        let a = Range::new(0, 2);
-        let b = Range::new(2, 4);
-        assert!(!a.overlaps(&b));
-        assert!(!b.overlaps(&a));
-    }
-
-    #[test]
-    fn cursor_inside_span_overlaps_but_at_far_edge_does_not() {
-        let span = Range::new(0, 3);
-        assert!(Range::cursor(2).overlaps(&span));
-        assert!(span.overlaps(&Range::cursor(2)));
-        // A cursor exactly at the far edge is a distinct position.
-        assert!(!Range::cursor(3).overlaps(&span));
-    }
-
-    #[test]
-    fn normalize_single_range_is_noop() {
-        let mut s = Selection {
-            ranges: vec![Range::new(7, 2)],
-            primary: 0,
-        };
-        let before = s.clone();
-        s.normalize();
-        assert_eq!(s, before);
-    }
-
-    #[test]
-    fn normalize_merges_overlapping_and_preserves_primary() {
-        let mut s = Selection {
-            ranges: vec![Range::new(0, 3), Range::new(2, 5)],
-            primary: 1,
-        };
-        s.normalize();
-        assert_eq!(s.ranges.len(), 1);
-        assert_eq!(s.ranges[0].min(), 0);
-        assert_eq!(s.ranges[0].max(), 5);
-        // The merged range still contains the old primary span [2,5].
-        let p = s.primary();
-        assert!(p.min() <= 2 && 5 <= p.max());
+    fn normalize_merges_overlapping_and_keeps_primary() {
+        let mut v = vec![sel(0, 0, 3, false), sel(1, 2, 5, false)];
+        let p = normalize(&mut v, 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].min(), v[0].max()), (0, 5));
+        // The merged range carries the primary id (1 swallowed 0).
+        assert_eq!(p, 1);
+        assert_eq!(v[0].id, 1);
     }
 
     #[test]
     fn normalize_merges_duplicate_cursors() {
-        let mut s = Selection {
-            ranges: vec![Range::cursor(4), Range::cursor(4)],
-            primary: 0,
-        };
-        s.normalize();
-        assert_eq!(s.ranges.len(), 1);
-        assert_eq!(s.ranges[0], Range::cursor(4));
+        let mut v = vec![Selection::cursor(0, 4), Selection::cursor(1, 4)];
+        normalize(&mut v, 0);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].is_empty() && v[0].min() == 4);
     }
 
     #[test]
-    fn normalize_keeps_a_zero_width_primary_off_a_shared_edge() {
-        // A bare primary cursor at 4 sits on the far edge of an earlier span
-        // [2,4); it must stay the primary, not be reassigned to the span.
-        let mut s = Selection {
-            ranges: vec![Range::new(2, 4), Range::cursor(4)],
-            primary: 1,
-        };
-        s.normalize();
-        assert_eq!(s.ranges.len(), 2); // they touch but do not overlap
-        assert_eq!(s.primary(), Range::cursor(4));
+    fn normalize_keeps_a_cursor_off_a_shared_edge() {
+        // A bare cursor at 4 on the far edge of [2,4) stays distinct.
+        let mut v = vec![sel(0, 2, 4, false), Selection::cursor(1, 4)];
+        let p = normalize(&mut v, 1);
+        assert_eq!(v.len(), 2);
+        assert_eq!(p, 1);
     }
 
     #[test]
     fn normalize_keeps_distinct_cursors_sorted() {
-        let mut s = Selection {
-            ranges: vec![Range::cursor(9), Range::cursor(1), Range::cursor(5)],
-            primary: 0, // the cursor at 9
-        };
-        s.normalize();
-        assert_eq!(s.ranges.len(), 3);
-        assert_eq!(
-            s.ranges,
-            vec![Range::cursor(1), Range::cursor(5), Range::cursor(9)]
-        );
-        // primary tracked the cursor that was at 9 (now last).
-        assert_eq!(s.primary(), Range::cursor(9));
+        let mut v = vec![
+            Selection::cursor(0, 9),
+            Selection::cursor(1, 1),
+            Selection::cursor(2, 5),
+        ];
+        let p = normalize(&mut v, 0);
+        assert_eq!(v.iter().map(|s| s.min()).collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert_eq!(p, 0); // primary still the cursor that was at 9
     }
 }
