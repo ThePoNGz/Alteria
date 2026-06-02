@@ -61,9 +61,29 @@ We did **not** `use text::Selection` directly: keeping our own type lets us carr
 - `cargo build --workspace` — green.
 - KEYMAP behaviors unchanged: the full motion/expand/find/multicursor/undo e2e suite (ported to the new types) passes byte-for-byte.
 
-## 9. Commits (on `alteria_a1`)
+## 9. Zed-parity audit (post-implementation review)
+
+Three focused reviews against the local `zed-main` checkout (`editor` + `text` crates) confirmed the model **aligns with Zed** on every load-bearing decision, and surfaced one real fix:
+
+**Confirmed ALIGNED (with Zed file refs):**
+- **Selection restore** stores `(before, after)` anchored selections per undo step — same as Zed's `SelectionHistory.selections_by_transaction` (`editor.rs`). We co-locate them in the timeline `Entry` instead of a tx-keyed `HashMap`; equivalent and simpler (Alteria has no async/multi-buffer transaction creation).
+- **Transaction-id capture:** `start_transaction` + `inner.edit` + `end_transaction → (id, _)` is exactly Zed's `language::Buffer` pattern; Zed also doesn't surface the tx id from `edit` (the id you want is the *grouped* one from the transaction boundary).
+- **`Selection<T>` shape** (`id/start/end/reversed/goal`) and **`set_head`** reordering match `text::Selection` field-for-field.
+- **Multi-edit caret placement:** our `map_offset` (recompute every caret over the full sorted edit list) reproduces Zed's collective anchor-ride; the **span** anchor bias (`start=anchor_after`, `end=anchor_before`) matches Zed's `selection_to_anchor_selection`.
+
+**Fixed (this devlog's second commit):**
+- **Bare-cursor anchor bias.** Zed stores a collapsed cursor with `Bias::Right` on both ends (`anchor_after`); we had `Bias::Left`. Changed `buffer.rs::anchorize` to `anchor_after` to match `selection_to_anchor_selection`, so a foreign edit *at* the caret rides it rightward (matters for the anchor model and any future LSP/collab/format edit not routed through explicit re-placement). Added a direct test. Also made `Buffer::edit`/`undo`/`redo` `pub(crate)` so the undo timeline can only be driven through `History` — turning the 1:1-lockstep invariant from convention into a visibility guarantee.
+
+**Acceptable / deferred divergences (documented for the Planner):**
+- **Undo grouping disabled (`group_interval = 0`).** Zed's production default is 300ms time-coalescing (`ZERO` is test-only); ours is the interim choice that keeps each edit one transaction and the timeline 1:1 with Zed's stacks. When typing-coalescing lands, restore 300ms and record one `Entry` per *grouped* transaction id (out of scope here; a deliberate future concern).
+- **Cursor-at-a-span-endpoint does not merge.** Zed's `should_merge` absorbs a bare cursor sitting exactly on a span's boundary; Alteria keeps it a distinct caret. This is **pre-existing** behavior from plans 001/003 (with explicit tests), not introduced here and outside 005's scope — flagged for a future parity decision rather than changed mid-plan.
+- **Abutting-edit caret bias.** Zed switches the left caret of an end-to-start-touching edit pair to `Bias::Right`→`Left` (`next_is_adjacent`); unreachable today (edits are per-selection and coincident cursors merge first). Port when surround / auto-pair / snippet ops can emit touching non-merged edits.
+- **Selection-only undo steps on one shared timeline** (KEYMAP "one shared timeline" for `I/O/U/P`): Zed has no equivalent — its selection-undo is a *separate* `Ctrl+U` command. Our unified `Step::Edit | Step::SelectionOnly` stack is the necessary Alteria-specific adaptation.
+
+## 10. Commits (on `alteria_a1`)
 
 ```
 feat(core): rebuild edit/undo/selection on Zed's text model (anchors + clock/UndoMap)
+fix(core): bare-cursor anchor bias + pub(crate) undo entry points (Zed parity)
 ```
 (plus this devlog.)
