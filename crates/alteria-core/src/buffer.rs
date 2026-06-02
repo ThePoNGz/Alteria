@@ -166,7 +166,11 @@ impl Buffer {
     /// transaction and return its id, or `None` when there is nothing to do.
     /// Ranges must be sorted and non-overlapping (the executor guarantees it).
     /// Selection placement is the caller's job — anchors are re-set afterward.
-    pub fn edit(&mut self, edits: Vec<(Range<usize>, String)>) -> Option<TransactionId> {
+    ///
+    /// `pub(crate)`: every text mutation goes through the pipeline
+    /// (`executor` → records into `history`), never the frontend, so the
+    /// undo timeline stays in lockstep with `text::Buffer`'s stacks.
+    pub(crate) fn edit(&mut self, edits: Vec<(Range<usize>, String)>) -> Option<TransactionId> {
         if edits.is_empty() {
             return None;
         }
@@ -177,14 +181,16 @@ impl Buffer {
 
     /// Undo the most recent text transaction (Zed's clock + `UndoMap`); returns
     /// the undone transaction id, or `None` at the root. Selection restoration
-    /// is the history layer's job.
-    pub fn undo(&mut self) -> Option<TransactionId> {
+    /// is the history layer's job — drive this only through [`History::undo`]
+    /// (`pub(crate)`) so the timeline can't be bypassed.
+    pub(crate) fn undo(&mut self) -> Option<TransactionId> {
         self.inner.undo().map(|(id, _)| id)
     }
 
     /// Redo the most recently undone transaction (real redo = undo-of-undo via
     /// `UndoMap`); returns its id, or `None` when the redo stack is empty.
-    pub fn redo(&mut self) -> Option<TransactionId> {
+    /// Drive this only through [`History::redo`] (`pub(crate)`).
+    pub(crate) fn redo(&mut self) -> Option<TransactionId> {
         self.inner.redo().map(|(id, _)| id)
     }
 }
@@ -203,13 +209,15 @@ fn resolve(snap: &BufferSnapshot, s: &Selection<Anchor>) -> Selection<usize> {
     }
 }
 
-/// Re-anchor a resolved selection against `snap`. A bare cursor uses one anchor
-/// for both ends; a span biases its `start` rightward and its `end` leftward
-/// (`anchor_after`/`anchor_before`), so text typed just outside the span stays
-/// outside it.
+/// Re-anchor a resolved selection against `snap`, mirroring Zed's
+/// `selection_to_anchor_selection` (`editor/src/selections_collection.rs`): a
+/// **bare cursor** anchors both ends with `Bias::Right` (`anchor_after`), so a
+/// foreign insertion *at* the caret rides it rightward (past the inserted text);
+/// a **span** biases its `start` rightward (`anchor_after`) and its `end`
+/// leftward (`anchor_before`), so text typed just outside the span stays out.
 fn anchorize(snap: &BufferSnapshot, s: &Selection<usize>) -> Selection<Anchor> {
     let (start, end) = if s.start == s.end {
-        let a = snap.anchor_before(s.start);
+        let a = snap.anchor_after(s.start);
         (a, a)
     } else {
         (snap.anchor_after(s.start), snap.anchor_before(s.end))
@@ -267,6 +275,19 @@ mod tests {
         buf.edit(vec![(0..0, "XY".to_string())]);
         assert_eq!(buf.text(), "XYabcdef");
         assert_eq!(buf.primary_resolved().head(), 7); // 5 + 2 inserted
+    }
+
+    #[test]
+    fn a_resting_cursor_rides_an_insertion_at_its_offset() {
+        // Zed parity (selection_to_anchor_selection): a bare cursor anchors with
+        // Bias::Right, so a foreign edit inserting *exactly at* the caret pushes
+        // the caret past the inserted text rather than leaving it behind. (With
+        // Bias::Left the caret would wrongly stay at offset 1.)
+        let mut buf = Buffer::from_str("abc");
+        buf.set_cursor(1);
+        buf.edit(vec![(1..1, "XY".to_string())]); // inserted at the caret; not re-placed
+        assert_eq!(buf.text(), "aXYbc");
+        assert_eq!(buf.primary_resolved().head(), 3); // rode past "XY"
     }
 
     #[test]
