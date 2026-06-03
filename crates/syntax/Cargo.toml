@@ -1,0 +1,18 @@
+[package]
+name = "syntax"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+doctest = false
+
+# Pins match Zed exactly (`zed-main/Cargo.toml`): tree-sitter 0.26.9 (we drop the
+# `wasm` feature Zed enables — not needed for a native, synchronous parse) and
+# tree-sitter-rust 0.24.2. A grammar/query version skew is the classic breakage,
+# so these are deliberately locked to Zed's, our source of truth.
+[dependencies]
+rope = { path = "../rope" }
+tree-sitter = "0.26.9"
+tree-sitter-rust = "0.24.2"
