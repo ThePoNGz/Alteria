@@ -16,6 +16,8 @@
 
 use std::ops::Range;
 
+mod highlight;
+
 /// A source language the engine can highlight. One language for now (Rust),
 /// matching plan 009's scope: whole-buffer parse, single tree, no injections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +34,32 @@ pub struct Highlight {
     pub capture: u32,
 }
 
+/// The highlight query's capture names for `lang`, indexed by capture id: the
+/// name of the capture behind [`Highlight::capture`] `i` is
+/// `capture_names(lang)[i as usize]`. These come straight from the loaded
+/// `tree_sitter::Query::capture_names()`; the frontend maps each name to a theme
+/// color (the `capture -> color` seam this engine deliberately leaves out).
+pub fn capture_names(lang: Lang) -> Vec<&'static str> {
+    highlight::config(lang).query.capture_names().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::Parser;
+
+    /// The vendored Rust `highlights.scm` compiles against `tree-sitter-rust`
+    /// 0.24.2 and exposes a stable, non-empty set of capture names. A grammar/
+    /// query version skew (or a botched re-vendoring) breaks the query build.
+    #[test]
+    fn rust_highlight_query_compiles_and_exposes_captures() {
+        let names = crate::capture_names(crate::Lang::Rust);
+        assert!(!names.is_empty(), "the Rust query must define captures");
+        // A representative subset Zed's query is known to define; their absence
+        // would mean the query failed to load or the wrong grammar was linked.
+        for expected in ["keyword", "type", "function", "variable", "comment"] {
+            assert!(names.contains(&expected), "missing capture @{expected}");
+        }
+    }
 
     /// Smoke test: the pinned `tree-sitter` 0.26.9 runtime links the
     /// `tree-sitter-rust` 0.24.2 grammar and parses a trivial program. A version
