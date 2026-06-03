@@ -8,6 +8,7 @@ members = [
     "crates/clock",
     "crates/collections",
     "crates/text",
+    "crates/syntax",
     "crates/alteria-gpui",
 ]
 # Engine-only default set: `cargo test`/`build`/`clippy` with no `-p` stay
@@ -22,4 +23,5 @@ default-members = [
     "crates/clock",
     "crates/collections",
     "crates/text",
+    "crates/syntax",
 ]
