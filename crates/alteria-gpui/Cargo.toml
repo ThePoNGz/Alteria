@@ -1,0 +1,18 @@
+[package]
+name = "alteria-gpui"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+alteria-core = { path = "../alteria-core" }
+
+# GPUI is pinned to a concrete `zed-industries/zed` main SHA, not a floating rev
+# (CLAUDE.md hard rule). This SHA matches the `../zed-main` snapshot the API was
+# verified against (gpui 0.2.2, post-Blade→wgpu) and is proven to build on this
+# machine's stable toolchain. Bump deliberately; never float. The entry point is
+# `gpui_platform::application()`, so both crates are required at the same rev.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1dba7a28bb19ea2f3817ad7ed63a0fcb25d820d2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1dba7a28bb19ea2f3817ad7ed63a0fcb25d820d2", features = [
+    "wayland",
+    "x11",
+] }
