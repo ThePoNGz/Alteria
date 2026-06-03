@@ -1,5 +1,5 @@
-//! The root view: owns the [`Editor`], holds focus, and routes raw OS key and
-//! modifier events into the engine.
+//! The root view: owns the [`Editor`], holds focus, routes raw OS key and
+//! modifier events into the engine, and tracks the vertical scroll offset.
 //!
 //! This is the seam where the quasimode bet is wired up. Keys arrive through the
 //! **raw** `on_key_down` / `on_key_up` / `on_modifiers_changed` handlers — never
@@ -9,21 +9,43 @@
 //! says state changed. Focus loss feeds [`InputEvent::FocusLost`] so a held Alt
 //! can never get stuck — the same focus wiring Zed uses (`cx.on_blur` /
 //! `on_focus_out` in `editor/src/editor.rs`).
+//!
+//! Scrolling lives here too (plan 007): [`EditorView::scroll_top`] is a plain
+//! pixel offset, moved by the mouse wheel (`on_scroll_wheel`, an ordinary handler
+//! — *not* a quasimode) and by autoscroll after every state change so the primary
+//! cursor stays on screen. The viewport math is the gpui-free [`scroll`] module;
+//! this file only converts at the `Pixels` boundary. Mirrors Zed's
+//! `editor/src/element/mouse.rs` wheel handler and `scroll/autoscroll.rs`.
 
 use alteria_core::input::InputEvent;
 use alteria_core::Editor;
 use gpui::{
-    div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent, KeyUpEvent,
-    ModifiersChangedEvent, Window,
+    div, prelude::*, px, rgb, Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent,
+    ModifiersChangedEvent, Pixels, ScrollWheelEvent, Window,
 };
 
 use crate::event;
-use crate::text_element::TextElement;
+use crate::text_element::{row_col, TextElement};
+
+// `scroll.rs` is a top-level frontend file (`src/scroll.rs`, per plan 007), but
+// `main.rs` is off-limits for this plan, so the module is declared here with an
+// explicit `#[path]` rather than at the crate root. `pub(crate)` so the renderer
+// (`text_element`) can reach the same viewport math.
+#[path = "scroll.rs"]
+pub(crate) mod scroll;
 
 /// The single root view for the walking skeleton: one buffer, one focus handle.
 pub(crate) struct EditorView {
     pub(crate) editor: Editor,
     pub(crate) focus_handle: FocusHandle,
+    /// Vertical scroll offset in pixels (`0` = top of the buffer). The renderer
+    /// paints only the rows visible at this offset; the wheel handler and
+    /// autoscroll move it, always clamped to `[0, max]` (see [`scroll`]).
+    pub(crate) scroll_top: Pixels,
+    /// The text element's last painted bounds, cached each frame by the renderer
+    /// so autoscroll/wheel know the viewport height — the `last_bounds` pattern
+    /// from gpui's `examples/input.rs`. `None` until the first paint.
+    pub(crate) last_bounds: Option<Bounds<Pixels>>,
 }
 
 impl EditorView {
@@ -41,33 +63,93 @@ impl EditorView {
         EditorView {
             editor: Editor::new(text),
             focus_handle,
+            scroll_top: px(0.),
+            last_bounds: None,
         }
     }
 
-    fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.feed(event::from_key_down(ev), cx);
+    fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.feed(event::from_key_down(ev), window, cx);
     }
 
-    fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.feed(event::from_key_up(ev), cx);
+    fn on_key_up(&mut self, ev: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.feed(event::from_key_up(ev), window, cx);
     }
 
     fn on_modifiers_changed(
         &mut self,
         ev: &ModifiersChangedEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.feed(Some(event::from_modifiers_changed(ev)), cx);
+        self.feed(Some(event::from_modifiers_changed(ev)), window, cx);
     }
 
-    /// Hand a translated event to the engine and redraw only if it changed state.
-    fn feed(&mut self, input: Option<InputEvent>, cx: &mut Context<Self>) {
+    /// Mouse wheel → vertical scroll. An ordinary handler (not a quasimode): the
+    /// wheel `delta` becomes pixels via `line_height`, is subtracted from
+    /// `scroll_top` (scrolling down increases the offset), then clamped to the
+    /// content. Sign + clamp mirror Zed's `editor/src/element/mouse.rs`.
+    fn on_scroll_wheel(
+        &mut self,
+        ev: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_height = window.line_height();
+        let delta_y = ev.delta.pixel_delta(line_height).y;
+        let line_count = self.line_count();
+        let viewport_height = self.viewport_height(window);
+        let proposed = f32::from(self.scroll_top - delta_y);
+        let new_top = px(scroll::clamp_scroll_top(
+            proposed,
+            line_count,
+            f32::from(line_height),
+            f32::from(viewport_height),
+        ));
+        if new_top != self.scroll_top {
+            self.scroll_top = new_top;
+            cx.notify();
+        }
+    }
+
+    /// Hand a translated event to the engine; on a state change, keep the primary
+    /// cursor in view, then redraw.
+    fn feed(&mut self, input: Option<InputEvent>, window: &Window, cx: &mut Context<Self>) {
         if let Some(input) = input {
             if self.editor.handle(input) {
+                self.autoscroll_to_cursor(window);
                 cx.notify();
             }
         }
+    }
+
+    /// Keep the primary cursor on screen after a motion/edit — exactly as Zed
+    /// autoscrolls after a movement (`scroll/autoscroll.rs`). A no-op when the
+    /// cursor is already visible or the document is shorter than the viewport.
+    fn autoscroll_to_cursor(&mut self, window: &Window) {
+        let line_height = window.line_height();
+        let text = self.editor.buffer.text();
+        let (cursor_row, _) = row_col(&text, self.editor.buffer.primary_resolved().head());
+        let viewport_height = self.viewport_height(window);
+        self.scroll_top = px(scroll::autoscroll_top(
+            cursor_row,
+            f32::from(self.scroll_top),
+            f32::from(line_height),
+            f32::from(viewport_height),
+            text.split('\n').count(),
+        ));
+    }
+
+    /// Viewport height for the scroll math: the renderer's last painted height,
+    /// falling back to the window's content height before the first paint.
+    fn viewport_height(&self, window: &Window) -> Pixels {
+        self.last_bounds
+            .map(|bounds| bounds.size.height)
+            .unwrap_or_else(|| window.viewport_size().height)
+    }
+
+    fn line_count(&self) -> usize {
+        self.editor.buffer.text().split('\n').count()
     }
 }
 
@@ -84,6 +166,8 @@ impl Render for EditorView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            // The wheel is an ordinary (non-quasimode) handler.
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(TextElement { view: cx.entity() })
     }
 }
