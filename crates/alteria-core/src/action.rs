@@ -72,4 +72,16 @@ pub enum Action {
     SpawnCursor(Direction),
     /// `Ctrl+Z` — step back one entry in the history.
     Undo,
+    /// `Ctrl+Y` / `Ctrl+Shift+Z` — step forward one entry in the history
+    /// (real redo = undo-of-undo via Zed's `UndoMap`).
+    Redo,
+    /// Inject external text (paste / IME) at every cursor: replace each selection
+    /// with the string; an empty string deletes (the cut path). The pipeline-pure
+    /// analog of Zed's `replace_text_in_range` -> `editor.insert`.
+    InsertText(String),
+    /// Inject one string per cursor — multicursor paste distribution. When the
+    /// count matches the live cursors, the i-th cursor gets `texts[i]`; otherwise
+    /// the whole `\n`-joined text goes at every cursor (Zed `do_paste`'s
+    /// count-mismatch branch).
+    InsertTexts(Vec<String>),
 }

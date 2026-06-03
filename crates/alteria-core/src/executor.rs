@@ -48,6 +48,11 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
         Action::Undo => {
             history.undo(buffer);
         }
+        Action::Redo => {
+            history.redo(buffer);
+        }
+        Action::InsertText(text) => insert_text(buffer, history, &text),
+        Action::InsertTexts(texts) => insert_texts(buffer, history, texts),
     }
 }
 
@@ -69,6 +74,30 @@ fn insert_text(buffer: &mut Buffer, history: &mut History, s: &str) {
         .collect();
     // Follow each range's span end so the caret lands past the inserted text
     // even for a backward selection (where `head` is the span's left edge).
+    let targets: Vec<(usize, usize)> = resolved.iter().map(|sel| (sel.id, sel.max())).collect();
+    apply_edit(buffer, history, before, primary_id, edits, targets);
+}
+
+/// Inject one string per cursor — multicursor paste distribution. Mirrors Zed's
+/// `do_paste` (`editor/src/clipboard.rs`): when the slice count matches the live
+/// cursor count, the i-th cursor receives `texts[i]`; otherwise Zed clears the
+/// per-cursor metadata and pastes the **whole** clipboard string at every cursor
+/// — and that whole string is the per-cursor slices joined by `\n` (Zed's
+/// `do_copy` separator), so the mismatch fallback is exactly [`insert_text`] of
+/// the `\n`-joined text. Each caret lands past its own inserted text.
+fn insert_texts(buffer: &mut Buffer, history: &mut History, texts: Vec<String>) {
+    let resolved = buffer.resolved();
+    if texts.len() != resolved.len() {
+        insert_text(buffer, history, &texts.join("\n"));
+        return;
+    }
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let edits: Vec<(usize, usize, String)> = resolved
+        .iter()
+        .zip(texts)
+        .map(|(sel, t)| (sel.min(), sel.max(), t))
+        .collect();
     let targets: Vec<(usize, usize)> = resolved.iter().map(|sel| (sel.id, sel.max())).collect();
     apply_edit(buffer, history, before, primary_id, edits, targets);
 }
@@ -858,6 +887,76 @@ mod tests {
         assert_eq!(heads(&b), vec![1, 3]);
     }
 
+    // ---- external text injection (paste / IME): InsertText / InsertTexts -
+
+    #[test]
+    fn insert_text_at_a_bare_cursor_inserts_and_advances() {
+        let mut b = at("ab", 1);
+        run(&mut b, Action::InsertText("XY".to_string()));
+        assert_eq!(b.text(), "aXYb");
+        assert_eq!(head(&b), 3);
+    }
+
+    #[test]
+    fn insert_text_over_a_span_replaces_it() {
+        let mut b = span("abc", 0, 3);
+        run(&mut b, Action::InsertText("XY".to_string()));
+        assert_eq!(b.text(), "XY");
+        assert_eq!(head(&b), 2);
+    }
+
+    #[test]
+    fn insert_text_inserts_at_every_cursor() {
+        let mut b = cursors("abcde", &[1, 3]);
+        run(&mut b, Action::InsertText("XY".to_string()));
+        assert_eq!(b.text(), "aXYbcXYde");
+        assert_eq!(heads(&b), vec![3, 7]);
+    }
+
+    #[test]
+    fn insert_empty_text_over_a_span_deletes_it() {
+        // Exactly the delete cut relies on (Zed `cut_common` -> `insert("")`).
+        let mut b = span("abcde", 1, 4); // "bcd" selected
+        run(&mut b, Action::InsertText(String::new()));
+        assert_eq!(b.text(), "ae");
+        assert_eq!(head(&b), 1);
+        assert!(b.primary_resolved().is_empty());
+    }
+
+    #[test]
+    fn insert_texts_distributes_one_slice_per_cursor() {
+        let mut b = cursors("ab", &[0, 1]);
+        run(
+            &mut b,
+            Action::InsertTexts(vec!["X".to_string(), "Y".to_string()]),
+        );
+        assert_eq!(b.text(), "XaYb");
+        assert_eq!(heads(&b), vec![1, 3]);
+    }
+
+    #[test]
+    fn insert_texts_count_mismatch_inserts_whole_at_each() {
+        // 1 slice, 2 cursors: Zed `do_paste`'s mismatch branch pastes the whole
+        // clipboard string at every cursor.
+        let mut b = cursors("ab", &[0, 1]);
+        run(&mut b, Action::InsertTexts(vec!["P".to_string()]));
+        assert_eq!(b.text(), "PaPb");
+        assert_eq!(heads(&b), vec![1, 3]);
+    }
+
+    #[test]
+    fn insert_texts_count_mismatch_joins_slices_with_newline() {
+        // More slices than cursors: the "whole" text is the slices joined by '\n'
+        // (Zed's clipboard string), inserted at the single cursor.
+        let mut b = at("xy", 1);
+        run(
+            &mut b,
+            Action::InsertTexts(vec!["a".to_string(), "b".to_string()]),
+        );
+        assert_eq!(b.text(), "xa\nby");
+        assert_eq!(head(&b), 4); // past "a\nb"
+    }
+
     // ---- char motions ---------------------------------------------------
 
     #[test]
@@ -1155,6 +1254,28 @@ mod tests {
         assert!(h.redo(&mut b)); // redo is an engine capability (KEYMAP: not yet bound)
         assert_eq!(b.text(), "Xabc");
         assert_eq!(head(&b), 1);
+    }
+
+    #[test]
+    fn redo_action_reapplies_an_undone_edit() {
+        // The bound verb: Action::Redo flows through the executor like Action::Undo.
+        let mut b = at("abc", 0);
+        let mut h = History::new();
+        apply(Action::InsertChar('X'), &mut b, &mut h);
+        apply(Action::Undo, &mut b, &mut h);
+        assert_eq!(b.text(), "abc");
+        apply(Action::Redo, &mut b, &mut h);
+        assert_eq!(b.text(), "Xabc"); // text restored
+        assert_eq!(head(&b), 1); // and the after-selection
+    }
+
+    #[test]
+    fn redo_action_at_top_of_stack_is_a_noop() {
+        let mut b = at("abc", 0);
+        let mut h = History::new();
+        apply(Action::Redo, &mut b, &mut h); // nothing was undone
+        assert_eq!(b.text(), "abc");
+        assert_eq!(head(&b), 0);
     }
 
     // ---- multicursor ----------------------------------------------------

@@ -59,6 +59,12 @@ const CTRL: Modifiers = Modifiers {
     shift: false,
     super_key: false,
 };
+const CTRL_SHIFT: Modifiers = Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: true,
+    super_key: false,
+};
 const ALT_CTRL: Modifiers = Modifiers {
     alt: true,
     ctrl: true,
@@ -88,7 +94,14 @@ impl Keymap {
 
         let mut ctrl = Layer::new();
         ctrl.bind(Key::Char('z'), Action::Undo);
+        ctrl.bind(Key::Char('y'), Action::Redo);
         layers.insert(CTRL, ctrl);
+
+        // Ctrl+Shift: the second redo binding (mirrors Zed-Linux, which binds
+        // `editor::Redo` to both `ctrl-y` and `ctrl-shift-z`).
+        let mut ctrl_shift = Layer::new();
+        ctrl_shift.bind(Key::Char('z'), Action::Redo);
+        layers.insert(CTRL_SHIFT, ctrl_shift);
 
         // Provisional multicursor spawn (KEYMAP.md "not yet specified").
         let mut alt_ctrl = Layer::new();
@@ -222,6 +235,17 @@ mod tests {
     #[test]
     fn ctrl_z_is_undo() {
         assert_eq!(km().lookup(CTRL, Key::Char('z')), Some(Action::Undo));
+    }
+
+    #[test]
+    fn ctrl_y_is_redo() {
+        assert_eq!(km().lookup(CTRL, Key::Char('y')), Some(Action::Redo));
+    }
+
+    #[test]
+    fn ctrl_shift_z_is_redo() {
+        // Mirror Zed-Linux: redo binds to both Ctrl+Y and Ctrl+Shift+Z.
+        assert_eq!(km().lookup(CTRL_SHIFT, Key::Char('z')), Some(Action::Redo));
     }
 
     #[test]

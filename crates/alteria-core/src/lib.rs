@@ -95,6 +95,12 @@ mod tests {
         shift: false,
         super_key: false,
     };
+    const CTRL_SHIFT: Modifiers = Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: true,
+        super_key: false,
+    };
 
     /// Small driving helpers for the end-to-end key sequences below.
     impl Editor {
@@ -219,6 +225,46 @@ mod tests {
         assert_eq!(e.buffer.text(), "foo");
         assert_eq!(e.head(), 0);
         assert!(e.buffer.primary_resolved().is_empty());
+    }
+
+    #[test]
+    fn redo_round_trips_text_and_selection_on_ctrl_y() {
+        // edit → undo (Ctrl+Z) → redo (Ctrl+Y) restores both text and caret.
+        let mut e = Editor::new("abc");
+        e.key('X', Modifiers::NONE); // "Xabc", caret 1
+        assert_eq!(e.buffer.text(), "Xabc");
+        e.hold(CTRL);
+        assert!(e.key('z', CTRL)); // undo
+        assert_eq!(e.buffer.text(), "abc");
+        assert!(e.key('y', CTRL)); // redo
+        assert_eq!(e.buffer.text(), "Xabc");
+        assert_eq!(e.head(), 1);
+        e.release();
+    }
+
+    #[test]
+    fn redo_also_works_on_ctrl_shift_z() {
+        let mut e = Editor::new("abc");
+        e.key('X', Modifiers::NONE); // "Xabc"
+        e.hold(CTRL);
+        e.key('z', CTRL); // undo -> "abc"
+        assert_eq!(e.buffer.text(), "abc");
+        e.release();
+        e.hold(CTRL_SHIFT);
+        assert!(e.key('Z', CTRL_SHIFT)); // redo (shifted 'Z', case-normalized)
+        assert_eq!(e.buffer.text(), "Xabc");
+        e.release();
+    }
+
+    #[test]
+    fn redo_at_top_of_stack_is_a_noop_but_still_dispatches() {
+        // Mirrors the Undo convention: handle returns true whenever the resolver
+        // produced an action, even if redo had nothing to do.
+        let mut e = Editor::new("abc");
+        e.hold(CTRL);
+        assert!(e.key('y', CTRL));
+        assert_eq!(e.buffer.text(), "abc");
+        e.release();
     }
 
     #[test]

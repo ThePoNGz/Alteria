@@ -43,7 +43,12 @@ pub enum Key {
 /// `ModifiersChanged` is the primitive the whole quasimode concept rides on:
 /// it fires whenever the held-modifier set changes, independent of any other
 /// key, so the resolver always knows which layer is active.
-#[derive(Clone, Copy, PartialEq, Debug)]
+///
+/// Not `Copy`: `InsertText` carries an owned `String` (external text from a
+/// paste or IME commit — the pipeline-pure analog of a platform `InputHandler`'s
+/// `replace_text_in_range`). The frontend moves each event into
+/// [`Editor::handle`](crate::Editor::handle), so it never needs to copy one.
+#[derive(Clone, PartialEq, Debug)]
 pub enum InputEvent {
     KeyDown {
         key: Key,
@@ -57,6 +62,9 @@ pub enum InputEvent {
     ModifiersChanged {
         mods: Modifiers,
     },
+    /// External text entering the buffer at every cursor (paste, later IME),
+    /// not a keystroke — the resolver passes it straight to the executor.
+    InsertText(String),
     FocusLost,
 }
 

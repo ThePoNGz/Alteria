@@ -128,6 +128,23 @@ impl Buffer {
             .collect()
     }
 
+    /// The text under each selection, in `resolved()` (document) order — the
+    /// `min..max` rope slice per selection, empty for a bare cursor.
+    ///
+    /// The read the frontend's copy/cut joins with `\n` to hand to the OS
+    /// clipboard, mirroring Zed's per-selection `text_for_range` gather
+    /// (`editor/src/clipboard.rs` `do_copy`). The per-cursor *length* metadata
+    /// Zed records is just `each.len()` on the frontend side — no core type yet.
+    /// The clipboard write itself stays in the (wave-2) frontend, which has `cx`.
+    pub fn selected_texts(&self) -> Vec<String> {
+        let resolved = self.resolved();
+        let rope = self.rope();
+        resolved
+            .iter()
+            .map(|s| rope.slice(s.min()..s.max()).to_string())
+            .collect()
+    }
+
     /// The primary selection resolved to byte offsets.
     pub fn primary_resolved(&self) -> Selection<usize> {
         let snap = self.inner.snapshot();
@@ -234,6 +251,17 @@ fn anchorize(snap: &BufferSnapshot, s: &Selection<usize>) -> Selection<Anchor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::SelectionGoal;
+
+    fn span(id: usize, start: usize, end: usize) -> Selection<usize> {
+        Selection {
+            id,
+            start,
+            end,
+            reversed: false,
+            goal: SelectionGoal::None,
+        }
+    }
 
     #[test]
     fn from_str_holds_the_text() {
@@ -288,6 +316,37 @@ mod tests {
         buf.edit(vec![(1..1, "XY".to_string())]); // inserted at the caret; not re-placed
         assert_eq!(buf.text(), "aXYbc");
         assert_eq!(buf.primary_resolved().head(), 3); // rode past "XY"
+    }
+
+    #[test]
+    fn selected_texts_single_selection_is_its_slice() {
+        let mut b = Buffer::from_str("abcde");
+        let id = b.primary_id();
+        b.set_selections(vec![span(id, 1, 4)], id);
+        assert_eq!(b.selected_texts(), vec!["bcd".to_string()]);
+    }
+
+    #[test]
+    fn selected_texts_bare_cursor_is_an_empty_string() {
+        let mut b = Buffer::from_str("abc");
+        b.set_cursor(2);
+        assert_eq!(b.selected_texts(), vec![String::new()]);
+    }
+
+    #[test]
+    fn selected_texts_multi_cursor_one_slice_each_in_document_order() {
+        let mut b = Buffer::from_str("abcdef");
+        b.set_selections(vec![span(0, 0, 2), span(1, 4, 6)], 0);
+        assert_eq!(b.selected_texts(), vec!["ab".to_string(), "ef".to_string()]);
+    }
+
+    #[test]
+    fn selected_texts_full_buffer_selection_is_the_whole_text() {
+        let mut b = Buffer::from_str("hello\nworld");
+        let id = b.primary_id();
+        let n = b.len();
+        b.set_selections(vec![span(id, 0, n)], id);
+        assert_eq!(b.selected_texts(), vec!["hello\nworld".to_string()]);
     }
 
     #[test]
