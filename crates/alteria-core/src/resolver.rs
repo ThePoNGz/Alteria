@@ -78,6 +78,9 @@ impl Resolver {
                 None
             }
             InputEvent::KeyUp { .. } => None,
+            // External text (paste / IME) is not a keystroke: pass it straight
+            // through, untouched by held-modifier or count/find state.
+            InputEvent::InsertText(text) => Some(Action::InsertText(text)),
             InputEvent::KeyDown { key, mods, .. } => self.resolve_key_down(key, mods, keymap),
         }
     }
@@ -212,6 +215,12 @@ mod tests {
         alt: false,
         ctrl: true,
         shift: false,
+        super_key: false,
+    };
+    const CTRL_SHIFT: Modifiers = Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: true,
         super_key: false,
     };
 
@@ -520,6 +529,41 @@ mod tests {
         assert_eq!(
             r.resolve(down(Key::Char('z'), CTRL), &k),
             Some(Action::Undo)
+        );
+    }
+
+    #[test]
+    fn ctrl_y_resolves_to_redo() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(CTRL), &k);
+        assert_eq!(
+            r.resolve(down(Key::Char('y'), CTRL), &k),
+            Some(Action::Redo)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_z_resolves_to_redo() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(CTRL_SHIFT), &k);
+        // The frontend may report the shifted 'Z'; commands are case-insensitive,
+        // and the held ctrl+shift selects the redo layer.
+        assert_eq!(
+            r.resolve(down(Key::Char('Z'), CTRL_SHIFT), &k),
+            Some(Action::Redo)
+        );
+    }
+
+    #[test]
+    fn insert_text_event_resolves_to_insert_text_action() {
+        // InsertText is not a keystroke: it carries external text (paste / IME)
+        // straight through to the executor, with no modifier/layer logic.
+        let mut r = Resolver::new();
+        assert_eq!(
+            r.resolve(InputEvent::InsertText("hi".to_string()), &km()),
+            Some(Action::InsertText("hi".to_string()))
         );
     }
 
