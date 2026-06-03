@@ -5147,6 +5147,7 @@ name = "syntax"
 version = "0.1.0"
 dependencies = [
  "rope",
+ "streaming-iterator",
  "tree-sitter",
  "tree-sitter-rust",
 ]

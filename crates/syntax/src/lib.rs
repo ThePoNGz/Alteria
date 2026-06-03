@@ -18,6 +18,8 @@ use std::ops::Range;
 
 mod highlight;
 
+pub use highlight::highlight;
+
 /// A source language the engine can highlight. One language for now (Rust),
 /// matching plan 009's scope: whole-buffer parse, single tree, no injections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +47,31 @@ pub fn capture_names(lang: Lang) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use rope::Rope;
     use tree_sitter::Parser;
+
+    use crate::{Highlight, Lang, capture_names, highlight};
+
+    fn rope(src: &str) -> Rope {
+        let mut r = Rope::new();
+        r.push(src);
+        r
+    }
+
+    fn name_of(h: &Highlight) -> &'static str {
+        capture_names(Lang::Rust)[h.capture as usize]
+    }
+
+    /// The span whose byte range is exactly the first occurrence of `needle`.
+    fn span_for<'a>(src: &str, spans: &'a [Highlight], needle: &str) -> &'a Highlight {
+        let start = src.find(needle).expect("needle is present in the fixture");
+        let range = start..start + needle.len();
+        spans.iter().find(|h| h.range == range).unwrap_or_else(|| {
+            panic!("no span exactly covering {needle:?} ({range:?}); got {spans:?}")
+        })
+    }
+
+    const FIXTURE: &str = "// greet\nfn main() {\n    let x = 1;\n    let s = \"hi\";\n}\n";
 
     /// The vendored Rust `highlights.scm` compiles against `tree-sitter-rust`
     /// 0.24.2 and exposes a stable, non-empty set of capture names. A grammar/
@@ -76,5 +102,58 @@ mod tests {
         let root = tree.root_node();
         assert_eq!(root.kind(), "source_file");
         assert!(!root.has_error());
+    }
+
+    /// The heart of the plan: a Rust fixture yields the right `(byte_range,
+    /// capture)` spans. Covers a keyword, a function name, a binding identifier,
+    /// a number literal, a string literal, and a comment. `main` exercises the
+    /// overlap rule — the catch-all `(identifier) @variable` and the more
+    /// specific `@function.definition` both cover it, and the specific one wins.
+    #[test]
+    fn highlights_keyword_function_variable_number_string_and_comment() {
+        let spans = highlight(&rope(FIXTURE), Lang::Rust);
+
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "// greet")), "comment");
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "fn")), "keyword");
+        assert_eq!(
+            name_of(span_for(FIXTURE, &spans, "main")),
+            "function.definition"
+        );
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "let")), "keyword");
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "x")), "variable");
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "1")), "number");
+        assert_eq!(name_of(span_for(FIXTURE, &spans, "\"hi\"")), "string");
+    }
+
+    #[test]
+    fn spans_are_sorted_and_non_overlapping() {
+        let spans = highlight(&rope(FIXTURE), Lang::Rust);
+        assert!(!spans.is_empty());
+        for h in &spans {
+            assert!(h.range.start < h.range.end, "empty span {h:?}");
+        }
+        for w in spans.windows(2) {
+            assert!(
+                w[0].range.end <= w[1].range.start,
+                "overlap or out of order: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_input_has_no_spans() {
+        assert!(highlight(&rope(""), Lang::Rust).is_empty());
+    }
+
+    /// tree-sitter is error-tolerant: garbage still parses (with ERROR nodes) and
+    /// highlighting must neither panic nor emit overlapping/disordered spans.
+    #[test]
+    fn non_rust_text_parses_without_panicking() {
+        let spans = highlight(&rope("@@@ >>> not ;; rust {{{ 123"), Lang::Rust);
+        for w in spans.windows(2) {
+            assert!(w[0].range.end <= w[1].range.start);
+        }
     }
 }
