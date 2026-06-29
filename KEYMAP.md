@@ -17,28 +17,47 @@ there is no mode to get stuck in (the quasimode guarantee).
 | *(none)* | Base | Ordinary editor — typing & standard edits |
 | `Alt` | Alt | Inverted-T navigation, motions, find, count, expansion |
 | `Alt+Shift` | Alt+Shift | The Alt motions, **extending** the selection |
-| `Ctrl` | Ctrl | Undo / redo |
+| `Ctrl` | Ctrl | Standard editor chords (select-all, clipboard, undo / redo) |
 | `Ctrl+Shift` | Ctrl+Shift | Redo (the second redo binding) |
 | `Alt+Ctrl` | Alt+Ctrl | Multicursor spawn *(provisional)* |
 
 ---
 
-## Base layer — no modifier held (an ordinary editor)
+## Base layer — ordinary editor surface
 
 With no modifier held, Alteria behaves like any plain editor: type to insert.
+The standard Shift and Ctrl chords below are part of the same no-mode editing
+surface, imported from Zed's Linux `Editor` keymap.
 
 | Key | Action |
 |---|---|
 | any printable char | insert at every cursor, advancing; a non-empty selection is **replaced** |
 | `Enter` | insert a newline at every cursor |
 | `Backspace` | delete the selection if any; else the grapheme before each cursor (no-op at buffer start) |
+| `Shift+Backspace` | same as `Backspace` |
+| `Delete` | delete the selection if any; else the grapheme after each cursor (no-op at buffer end) |
 | `Esc` | collapse selection spans, drop secondary cursors to the primary |
+| `Left` / `Right` | move one grapheme left / right, collapsing any selection |
+| `Up` / `Down` | move one line up / down, preserving the vertical goal column |
+| `Shift+Left` / `Shift+Right` | extend the selection one grapheme left / right |
+| `Shift+Up` / `Shift+Down` | extend the selection one line up / down |
+| `Home` | move to the current line beginning |
+| `End` | move to the current line end (before the trailing newline) |
+| `Shift+Home` | extend to the current line beginning |
+| `Shift+End` | extend to the current line end |
+| `PageUp` / `PageDown` | move one viewport page up / down |
+| `Shift+PageUp` / `Shift+PageDown` | extend one viewport page up / down |
 
 `Shift` alone is still the Base layer — it only capitalizes the typed character.
 
-> Standard mouse-drag / `Shift`+arrow selection and the `Ctrl+C/X/V`, `Ctrl+S`
-> conventions are part of the "ordinary editor by default" goal but are **not
-> yet bound** in the core keymap — see [Not yet bound](#not-yet-bound).
+Mouse:
+
+| Gesture | Action |
+|---|---|
+| left click | place the primary cursor at the clicked text position |
+| `Shift`+left click | extend the primary selection to the clicked text position |
+| left drag | select the dragged text span |
+| double click | select the clicked word if the imported Zed path is cheap in this slice; otherwise deferred |
 
 ---
 
@@ -114,10 +133,14 @@ are not motions and behave exactly as in the Alt layer.
 
 ---
 
-## Ctrl held — undo / redo
+## Ctrl held — standard editor chords
 
 | Key | Action |
 |---|---|
+| `A` | select the whole buffer |
+| `C` | copy selection text to the OS clipboard; empty selections copy the current line, matching Zed |
+| `X` | cut selection text to the OS clipboard; empty selections cut the current line, matching Zed |
+| `V` | paste OS clipboard text, distributing per-cursor clipboard metadata when available |
 | `Z` | undo — step back one entry (text edits **and** selection-only expansions share one timeline) |
 | `Y` | redo — step forward one entry (real redo = undo-of-undo via Zed's `UndoMap`) |
 
@@ -142,14 +165,14 @@ Spec not yet finalized; the current provisional bindings:
 
 ## Not yet bound
 
-These are deliberately unbound today; the listed core capability already exists
-where noted, so binding them is a small future step (mostly wave-2 frontend).
+These Zed Linux Editor bindings are deliberately outside plan 010's selected
+base-editor subset or depend on later file/UI systems.
 
 | Intended binding | Status / core capability |
 |---|---|
-| `Ctrl+C` copy | **wave 2** (frontend OS-clipboard write). Core gather: `Buffer::selected_texts()` |
-| `Ctrl+X` cut | **wave 2**. Core: `selected_texts()` to gather + `InsertText("")` to delete |
-| `Ctrl+V` paste | **wave 2** (frontend reads the OS clipboard). Core injection: `InsertText` / `InsertTexts` (per-cursor distribution) |
 | `Ctrl+S` save | not yet (no file I/O in core) |
-| forward `Delete` | not yet |
-| mouse / `Shift`+arrow selection | frontend; not yet in the core keymap |
+| `Tab` / `Shift+Tab` | deferred indentation plan |
+| `Ctrl+Backspace` / `Ctrl+Delete` | deferred word-deletion import |
+| `Ctrl+Left` / `Ctrl+Right` and Shift variants | deferred word-motion import |
+| `Ctrl+Home` / `Ctrl+End` and Shift variants | deferred document-edge import |
+| `Ctrl+L` | deferred line-selection import |

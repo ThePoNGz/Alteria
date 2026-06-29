@@ -1,0 +1,68 @@
+# Devlog 010 - Import Zed's base editor layer
+
+**Date:** 2026-06-29
+**Plan:** `plans/010-base-editor-layer.md`
+**Branch:** `alteria_a10`
+**Status:** In progress. T0 audit complete; T1 keymap spec started.
+
+## T0 Runtime Audit
+
+Checks run before code changes:
+
+| Check | Result |
+|---|---|
+| `cargo test` | pass: `alteria-core` 173 tests, `syntax` 6 tests, vendored crates/doc tests clean |
+| `cargo test -p alteria-gpui` | pass: 27 tests |
+| `cargo build -p alteria-gpui` | pass |
+| `cargo run -p alteria-gpui Cargo.toml` | launched and stayed running; closed with Ctrl-C after confirming startup |
+
+Manual GUI interaction was not verified through the terminal session. The app launch
+itself works from this branch and display environment.
+
+## Direct Dependency Audit
+
+Directly depending on Zed's `editor` crate is not a good fit for this slice.
+`../zed-main/crates/editor/Cargo.toml` pulls the full Zed application stack:
+`gpui`, `project`, `workspace`, `settings`, `theme`, `language`,
+`multi_buffer`, LSP, git, client/RPC, UI crates, telemetry, and more.
+
+Alteria's current shape is a single-buffer editor with a gpui-free
+`alteria-core`; importing `editor` directly would pull GPUI and application
+state into the backend boundary. The selected behavior will therefore be ported
+into Alteria's smaller seams while following Zed behavior and naming the
+simplifications.
+
+## Import Map
+
+| Behavior | Zed source | Alteria target | Decision |
+|---|---|---|---|
+| Linux base bindings | `assets/keymaps/default-linux.json` Editor block lines 67-122 | `KEYMAP.md`, `input.rs`, `keymap.rs`, `resolver.rs`, `event.rs` | Port selected Linux subset |
+| Action surface | `crates/editor/src/actions.rs` | `action.rs` | Port plain-data variants; no GPUI `Action` derive |
+| Text insertion | `crates/editor/src/input.rs::handle_input`, `insert`, `replace_selections` | existing `InputEvent::InsertText`, executor insert paths | Existing core path already mirrors the single-buffer subset |
+| Backspace/delete | `crates/editor/src/editor.rs::backspace`, `delete` | `executor.rs` | Backspace mostly present; forward delete to add |
+| Left/right/up/down | `crates/editor/src/movement.rs` | `executor.rs` `Motion::Char` | Existing single-buffer subset matches core ideas: wrap, clip, vertical goal |
+| Home/End | `movement.rs::line_beginning`, `line_end`; action structs with soft-wrap/indent flags | `executor.rs` `Motion::LineEdge` plus base bindings | Port logical-line subset; soft-wrap and indent-stop parity deferred until display map/indent support exists |
+| Page movement | `actions.rs::MovePageUp/MovePageDown`, `movement.rs::up_by_rows/down_by_rows`, scroll/autoscroll | core page-row action plus `alteria-gpui` viewport plumbing | Port visible-row subset using current viewport height/line height |
+| Select all | `crates/editor/src/selection.rs::select_all` | `executor.rs`, `buffer.rs` | Port whole-buffer selection as `0..len` in single-buffer offset space |
+| Clipboard copy/cut/paste | `crates/editor/src/clipboard.rs::do_copy`, `cut_common`, `paste`, `do_paste` | core facade effects plus `alteria-gpui` clipboard handling | Port OS I/O in frontend; keep core gpui-free |
+| Mouse selection | `crates/editor/src/element/mouse.rs`, `selection.rs::SelectPhase` | `text_element.rs`, `view.rs`, possibly `mouse.rs` | Port single-buffer click/shift-click/drag; defer gutter, multibuffer, drag-drop moving |
+| Platform text input / IME | `crates/editor/src/input.rs`, GPUI `InputHandler` examples | `alteria-gpui` input seam | Committed text path to port; marked-text composition likely deferred |
+
+## Zed Bindings Selected For This Plan
+
+Imported from the Linux Editor context:
+
+- `backspace`, `shift-backspace`, `delete`
+- `ctrl-c`, `ctrl-x`, `ctrl-v`
+- `ctrl-z`, `ctrl-y`, `ctrl-shift-z`
+- `up`, `down`, `left`, `right`
+- `shift-up`, `shift-down`, `shift-left`, `shift-right`
+- `home`, `end`, `shift-home`, `shift-end`
+- `pageup`, `pagedown`, `shift-pageup`, `shift-pagedown`
+- `ctrl-a`
+
+Skipped Zed bindings in the same block for this slice: Tab/backtab, word
+deletion/motion (`ctrl-backspace`, `ctrl-delete`, `ctrl-left`, `ctrl-right` and
+shift variants), document start/end, line select, formatting, code actions,
+signature help, git/diff/editor UI commands, character palette, and line-number
+toggles. Those are outside plan 010's selected normal-editor subset.
