@@ -19,6 +19,7 @@
 
 use std::ops::Range;
 
+use alteria_core::buffer::ClipboardSelection;
 use alteria_core::input::InputEvent;
 use alteria_core::{Editor, EditorEffect};
 use gpui::{
@@ -195,11 +196,18 @@ impl EditorView {
                     ClipboardEntry::String(s) => Some(s),
                     _ => None,
                 });
-                let (text, lengths) = match clipboard_string {
+                let (text, metadata) = match clipboard_string {
                     Some(s) => (
                         s.text().to_string(),
-                        s.metadata_json::<Vec<(usize, bool)>>()
-                            .map(|metadata| metadata.into_iter().map(|(len, _)| len).collect()),
+                        s.metadata_json::<Vec<(usize, bool)>>().map(|metadata| {
+                            metadata
+                                .into_iter()
+                                .map(|(len, is_entire_line)| ClipboardSelection {
+                                    len,
+                                    is_entire_line,
+                                })
+                                .collect()
+                        }),
                     ),
                     None => {
                         let Some(text) = item.text() else {
@@ -208,7 +216,7 @@ impl EditorView {
                         (text, None)
                     }
                 };
-                self.editor.paste_clipboard(text, lengths)
+                self.editor.paste_clipboard(text, metadata)
             }
             EditorEffect::MovePage { direction, extend } => {
                 let rows = self.page_row_count(window);

@@ -47,8 +47,8 @@ pub enum EditorEffect {
         text: String,
         selections: Vec<ClipboardSelection>,
     },
-    /// Read the OS clipboard and feed it back through `InputEvent::InsertText`
-    /// or `Action::InsertTexts`.
+    /// Read the OS clipboard and feed it back through the metadata-aware paste
+    /// helper.
     ReadClipboardAndPaste,
     /// Re-run the page move with the frontend's current visible-row count.
     MovePage { direction: Direction, extend: bool },
@@ -144,15 +144,15 @@ impl Editor {
         true
     }
 
-    /// Paste clipboard text with optional per-selection byte lengths from Zed
-    /// clipboard metadata. Count mismatch falls back to inserting the whole text
-    /// at every cursor, matching Zed `do_paste`.
-    pub fn paste_clipboard(&mut self, text: String, lengths: Option<Vec<usize>>) -> bool {
-        let action = lengths
-            .and_then(|lengths| split_clipboard_text(&text, &lengths))
-            .map(Action::InsertTexts)
-            .unwrap_or(Action::InsertText(text));
-        executor::apply(action, &mut self.buffer, &mut self.history);
+    /// Paste clipboard text with optional Zed-style per-selection metadata.
+    /// Metadata count mismatch falls back to Zed's whole-clipboard behavior, and
+    /// full-line metadata pastes before the current line for empty destinations.
+    pub fn paste_clipboard(
+        &mut self,
+        text: String,
+        metadata: Option<Vec<ClipboardSelection>>,
+    ) -> bool {
+        executor::paste_clipboard(&mut self.buffer, &mut self.history, text, metadata);
         true
     }
 
@@ -212,27 +212,6 @@ impl Editor {
             selections: data.selections,
         }
     }
-}
-
-fn split_clipboard_text(text: &str, lengths: &[usize]) -> Option<Vec<String>> {
-    let mut start: usize = 0;
-    let mut pieces = Vec::with_capacity(lengths.len());
-    for (ix, len) in lengths.iter().copied().enumerate() {
-        let end = start.checked_add(len)?;
-        if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-            return None;
-        }
-        pieces.push(text[start..end].to_string());
-        start = end;
-        if ix + 1 < lengths.len() {
-            if text[start..].starts_with('\n') {
-                start += 1;
-            } else {
-                return None;
-            }
-        }
-    }
-    (start == text.len()).then_some(pieces)
 }
 
 #[cfg(test)]
@@ -535,7 +514,44 @@ mod tests {
         e.hold(ALT_CTRL);
         e.key('s', ALT_CTRL);
         e.release();
-        assert!(e.paste_clipboard("xx\nyy".to_string(), Some(vec![2, 2])));
+        assert!(e.paste_clipboard(
+            "xx\nyy".to_string(),
+            Some(vec![
+                buffer::ClipboardSelection {
+                    len: 2,
+                    is_entire_line: false,
+                },
+                buffer::ClipboardSelection {
+                    len: 2,
+                    is_entire_line: false,
+                },
+            ]),
+        ));
+        assert_eq!(e.buffer.text(), "xxa\nyyb");
+    }
+
+    #[test]
+    fn paste_clipboard_full_line_metadata_inserts_before_current_line() {
+        let mut e = Editor::new("one\ntwo");
+        e.buffer.set_cursor(5);
+        assert!(e.paste_clipboard(
+            "copied\n".to_string(),
+            Some(vec![buffer::ClipboardSelection {
+                len: 7,
+                is_entire_line: true,
+            }]),
+        ));
+        assert_eq!(e.buffer.text(), "one\ncopied\ntwo");
+        assert_eq!(e.head(), 12);
+    }
+
+    #[test]
+    fn paste_clipboard_without_metadata_distributes_matching_lines() {
+        let mut e = Editor::new("a\nb");
+        e.hold(ALT_CTRL);
+        e.key('s', ALT_CTRL);
+        e.release();
+        assert!(e.paste_clipboard("xx\nyy".to_string(), None));
         assert_eq!(e.buffer.text(), "xxa\nyyb");
     }
 

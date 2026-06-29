@@ -22,7 +22,7 @@ use rope::{Point, Rope};
 use sum_tree::Bias;
 
 use crate::action::{Action, Direction, Expansion, Motion};
-use crate::buffer::{line_content_len, nav_line_count, Buffer};
+use crate::buffer::{line_content_len, nav_line_count, Buffer, ClipboardSelection};
 use crate::char_kind::{char_kind, find_boundary, find_preceding_boundary, CharKind};
 use crate::expand;
 use crate::find;
@@ -109,6 +109,112 @@ fn insert_texts(buffer: &mut Buffer, history: &mut History, texts: Vec<String>) 
         .collect();
     let targets: Vec<(usize, usize)> = resolved.iter().map(|sel| (sel.id, sel.max())).collect();
     apply_edit(buffer, history, before, primary_id, edits, targets);
+}
+
+/// Paste OS clipboard text, using Zed clipboard metadata when available.
+///
+/// The important Zed branch here is full-line paste: if a slice came from an
+/// empty selection that copied a whole line, and the live destination selection
+/// is also empty, insert that slice before the current line instead of at the
+/// cursor column. Without metadata, mirror Zed's external-editor fallback:
+/// distribute one line per cursor only when line count exactly matches the live
+/// selection count.
+pub(crate) fn paste_clipboard(
+    buffer: &mut Buffer,
+    history: &mut History,
+    text: String,
+    metadata: Option<Vec<ClipboardSelection>>,
+) {
+    match metadata {
+        Some(metadata) => paste_clipboard_with_metadata(buffer, history, &text, metadata),
+        None => paste_clipboard_without_metadata(buffer, history, &text),
+    }
+}
+
+fn paste_clipboard_without_metadata(buffer: &mut Buffer, history: &mut History, text: &str) {
+    let selection_count = buffer.resolved().len();
+    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if selection_count > 1 && lines.len() == selection_count {
+        insert_texts(buffer, history, lines);
+    } else {
+        insert_text(buffer, history, text);
+    }
+}
+
+fn paste_clipboard_with_metadata(
+    buffer: &mut Buffer,
+    history: &mut History,
+    text: &str,
+    metadata: Vec<ClipboardSelection>,
+) {
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+    let all_selections_were_entire_line = metadata.iter().all(|selection| selection.is_entire_line);
+    let use_per_selection_metadata = metadata.len() == resolved.len();
+
+    let mut start = 0;
+    let mut edits = Vec::with_capacity(resolved.len());
+    let mut targets = Vec::with_capacity(resolved.len());
+    for (ix, selection) in resolved.iter().enumerate() {
+        let (to_insert, entire_line) = if use_per_selection_metadata {
+            let Some((piece, next_start)) = clipboard_piece(text, &metadata, ix, start) else {
+                paste_clipboard_without_metadata(buffer, history, text);
+                return;
+            };
+            start = next_start;
+            (piece.to_string(), metadata[ix].is_entire_line)
+        } else {
+            (text.to_string(), all_selections_were_entire_line)
+        };
+
+        let (from, to) = if selection.is_empty() && entire_line {
+            let start = line_start(buffer.rope(), selection.head());
+            (start, start)
+        } else {
+            (selection.min(), selection.max())
+        };
+        edits.push((from, to, to_insert));
+        targets.push((selection.id, selection.max()));
+    }
+
+    if use_per_selection_metadata && start != text.len() {
+        paste_clipboard_without_metadata(buffer, history, text);
+        return;
+    }
+
+    edits.sort_by_key(|(from, to, _)| (*from, *to));
+    let mut merged: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == edit.0 && last.1 == edit.1 && edit.0 == edit.1 {
+                last.2.push_str(&edit.2);
+                continue;
+            }
+        }
+        merged.push(edit);
+    }
+
+    apply_edit(buffer, history, before, primary_id, merged, targets);
+}
+
+fn clipboard_piece<'a>(
+    text: &'a str,
+    metadata: &[ClipboardSelection],
+    ix: usize,
+    start: usize,
+) -> Option<(&'a str, usize)> {
+    let selection = metadata[ix];
+    let end = start.checked_add(selection.len)?;
+    if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return None;
+    }
+    let next_start = if selection.is_entire_line || ix + 1 == metadata.len() {
+        end
+    } else {
+        text.get(end..)?.starts_with('\n').then_some(end + 1)?
+    };
+    Some((&text[start..end], next_start))
 }
 
 /// `Backspace`: a non-empty selection is deleted whole (standard editor
