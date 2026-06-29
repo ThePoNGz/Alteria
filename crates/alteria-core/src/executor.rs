@@ -35,13 +35,22 @@ pub fn apply(action: Action, buffer: &mut Buffer, history: &mut History) {
         Action::InsertChar(c) => insert_text(buffer, history, &c.to_string()),
         Action::InsertNewline => insert_text(buffer, history, "\n"),
         Action::DeleteBackward => delete_backward(buffer, history),
+        Action::DeleteForward => delete_forward(buffer, history),
         Action::CollapseSelection => collapse(buffer),
         Action::Move {
             motion,
             extend,
             count,
         } => move_all(buffer, motion, extend, count),
+        Action::MovePage {
+            direction,
+            extend,
+            rows,
+        } => move_page(buffer, direction, extend, rows),
         Action::SpawnCursor(dir) => spawn_cursor(buffer, dir),
+        Action::SelectAll => select_all(buffer),
+        Action::Copy | Action::Paste => {}
+        Action::Cut => insert_text(buffer, history, ""),
         Action::Expand(kind) => expand_primary(buffer, history, kind),
         Action::FindChar { ch } => find_move(buffer, ch, true),
         Action::FindRepeat { ch, forward } => find_move(buffer, ch, forward),
@@ -155,6 +164,77 @@ fn delete_backward(buffer: &mut Buffer, history: &mut History) {
     apply_edit(buffer, history, before, primary_id, edits, targets);
 }
 
+/// `Delete`: a non-empty selection is deleted whole; a bare cursor deletes the
+/// grapheme after its head (a cursor at the buffer end contributes nothing).
+/// Mirrors Zed `editor.rs::delete`: extend right, then insert `""`.
+fn delete_forward(buffer: &mut Buffer, history: &mut History) {
+    let before = buffer.selection.clone();
+    let primary_id = buffer.primary_id();
+    let resolved = buffer.resolved();
+
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    {
+        let text = buffer.rope();
+        for sel in &resolved {
+            if sel.is_empty() {
+                let head = sel.head();
+                let to = grapheme_right(text, head);
+                if to == head {
+                    targets.push((sel.id, head));
+                } else {
+                    intervals.push((head, to));
+                    targets.push((sel.id, head));
+                }
+            } else {
+                intervals.push((sel.min(), sel.max()));
+                targets.push((sel.id, sel.min()));
+            }
+        }
+    }
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_by_key(|iv| iv.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+    for iv in intervals {
+        match merged.last_mut() {
+            Some(last) if iv.0 < last.1 => last.1 = last.1.max(iv.1),
+            _ => merged.push(iv),
+        }
+    }
+    let edits: Vec<(usize, usize, String)> = merged
+        .into_iter()
+        .map(|(a, b)| (a, b, String::new()))
+        .collect();
+    apply_edit(buffer, history, before, primary_id, edits, targets);
+}
+
+/// Delete explicit resolved ranges while preserving `before` as the undo
+/// selection. Used by cut so empty-cursor line expansion does not become the
+/// selection restored by undo.
+pub(crate) fn delete_resolved_ranges(
+    buffer: &mut Buffer,
+    history: &mut History,
+    before: Selections,
+    primary_id: usize,
+    resolved: Vec<Selection<usize>>,
+) {
+    let mut edits = Vec::new();
+    let mut targets = Vec::new();
+    for range in resolved {
+        if range.min() != range.max() {
+            edits.push((range.min(), range.max(), String::new()));
+        }
+        targets.push((range.id, range.min()));
+    }
+    if edits.is_empty() {
+        return;
+    }
+    edits.sort_by_key(|edit| edit.0);
+    apply_edit(buffer, history, before, primary_id, edits, targets);
+}
+
 /// Apply `edits` (each `(from, to, text)`, **sorted and non-overlapping** in old
 /// coordinates) as one undoable transaction, then place each cursor at its
 /// mapped `target` (`(id, old_offset)`) and merge overlaps. `target` offsets are
@@ -220,6 +300,22 @@ fn collapse(buffer: &mut Buffer) {
     buffer.set_cursor(head);
 }
 
+/// Select the entire buffer (`Anchor::Min..Anchor::Max` in Zed, represented here
+/// as the whole byte range in the current single buffer).
+fn select_all(buffer: &mut Buffer) {
+    let id = buffer.primary_id();
+    buffer.set_selections(
+        vec![Selection {
+            id,
+            start: 0,
+            end: buffer.len(),
+            reversed: false,
+            goal: SelectionGoal::None,
+        }],
+        id,
+    );
+}
+
 /// Move every selection's head `count` times, extending or collapsing, then
 /// merge any selections that now coincide.
 fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
@@ -248,6 +344,18 @@ fn move_all(buffer: &mut Buffer, motion: Motion, extend: bool, count: usize) {
             .collect()
     };
     buffer.set_selections(new, primary_id);
+}
+
+fn move_page(buffer: &mut Buffer, direction: Direction, extend: bool, rows: usize) {
+    if rows == 0 {
+        return;
+    }
+    match direction {
+        Direction::Up | Direction::Down => {
+            move_all(buffer, Motion::Char(direction), extend, rows);
+        }
+        Direction::Left | Direction::Right => {}
+    }
 }
 
 /// Move one head, returning the new head and the goal column to carry forward.
@@ -789,6 +897,30 @@ mod tests {
     }
 
     #[test]
+    fn delete_forward_removes_next_char() {
+        let mut b = at("abc", 1);
+        run(&mut b, Action::DeleteForward);
+        assert_eq!(b.text(), "ac");
+        assert_eq!(head(&b), 1);
+    }
+
+    #[test]
+    fn delete_forward_at_end_is_noop() {
+        let mut b = at("abc", 3);
+        run(&mut b, Action::DeleteForward);
+        assert_eq!(b.text(), "abc");
+        assert_eq!(head(&b), 3);
+    }
+
+    #[test]
+    fn delete_forward_multibyte() {
+        let mut b = at("aéb", 1); // cursor before 'é' (é=1..3)
+        run(&mut b, Action::DeleteForward);
+        assert_eq!(b.text(), "ab");
+        assert_eq!(head(&b), 1);
+    }
+
+    #[test]
     fn backspace_over_a_span_deletes_the_selection() {
         let mut b = span("abcde", 1, 4); // "bcd" selected
         run(&mut b, Action::DeleteBackward);
@@ -803,6 +935,15 @@ mod tests {
         run(&mut b, Action::DeleteBackward);
         assert_eq!(b.text(), "ae");
         assert_eq!(head(&b), 1);
+    }
+
+    #[test]
+    fn delete_forward_over_a_span_deletes_the_selection() {
+        let mut b = span("abcde", 1, 4);
+        run(&mut b, Action::DeleteForward);
+        assert_eq!(b.text(), "ae");
+        assert_eq!(head(&b), 1);
+        assert!(b.primary_resolved().is_empty());
     }
 
     #[test]
@@ -1118,6 +1259,34 @@ mod tests {
         assert_eq!(head(&b), 3); // before the '\n'
     }
 
+    #[test]
+    fn page_move_uses_supplied_visible_row_count() {
+        let mut b = at("a\nb\nc\nd", 0);
+        run(
+            &mut b,
+            Action::MovePage {
+                direction: Direction::Down,
+                extend: false,
+                rows: 2,
+            },
+        );
+        assert_eq!(head(&b), 4); // line 2, col 0
+    }
+
+    #[test]
+    fn shift_page_move_extends() {
+        let mut b = at("a\nb\nc\nd", 0);
+        run(
+            &mut b,
+            Action::MovePage {
+                direction: Direction::Down,
+                extend: true,
+                rows: 2,
+            },
+        );
+        assert_eq!(span_of(&b), (0, 4));
+    }
+
     // ---- blank-line leaps ----------------------------------------------
 
     #[test]
@@ -1229,6 +1398,14 @@ mod tests {
         run(&mut b, Action::CollapseSelection);
         assert_eq!(head(&b), 4);
         assert!(b.primary_resolved().is_empty());
+    }
+
+    #[test]
+    fn select_all_selects_the_whole_buffer() {
+        let mut b = at("abc\ndef", 4);
+        run(&mut b, Action::SelectAll);
+        assert_eq!(span_of(&b), (0, b.len()));
+        assert!(!b.primary_resolved().reversed);
     }
 
     // ---- undo / redo through the executor and history ------------------

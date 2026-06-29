@@ -19,6 +19,25 @@ use text::{Anchor, BufferId, BufferSnapshot, ReplicaId, ToOffset, TransactionId}
 
 use crate::selection::{normalize, Selection, Selections};
 
+/// Per-selection clipboard metadata, mirroring the subset of Zed's
+/// `ClipboardSelection` Alteria needs for multi-cursor paste distribution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClipboardSelection {
+    /// The number of bytes copied for this selection.
+    pub len: usize,
+    /// True when an empty cursor copied/cut its whole line.
+    pub is_entire_line: bool,
+}
+
+/// Clipboard text plus metadata and the resolved ranges that should be deleted
+/// for cut.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClipboardData {
+    pub text: String,
+    pub selections: Vec<ClipboardSelection>,
+    pub delete_ranges: Vec<Selection<usize>>,
+}
+
 /// The byte length of line `row`'s content, excluding its trailing line break
 /// (`\n`, and a `\r` immediately before it for `\r\n` endings).
 ///
@@ -145,6 +164,58 @@ impl Buffer {
             .collect()
     }
 
+    /// Gather text for copy/cut using Zed's normal editor rule: empty selections
+    /// copy the whole current line. The OS clipboard write stays in the
+    /// frontend; this returns plain data only.
+    pub fn clipboard_data(&self) -> ClipboardData {
+        let resolved = self.resolved();
+        let rope = self.rope();
+        let mut text = String::new();
+        let mut selections = Vec::with_capacity(resolved.len());
+        let mut delete_ranges = Vec::with_capacity(resolved.len());
+        let mut first = true;
+        let mut prev_entire_line = false;
+
+        for sel in resolved {
+            let is_entire_line = sel.is_empty();
+            let (range, add_trailing_newline) = if is_entire_line {
+                line_range_for_offset(rope, sel.head())
+            } else {
+                (sel.min()..sel.max(), false)
+            };
+
+            if first {
+                first = false;
+            } else if !prev_entire_line {
+                text.push('\n');
+            }
+            prev_entire_line = is_entire_line;
+
+            let before_len = text.len();
+            text.push_str(&rope.slice(range.clone()).to_string());
+            if add_trailing_newline {
+                text.push('\n');
+            }
+            selections.push(ClipboardSelection {
+                len: text.len() - before_len,
+                is_entire_line,
+            });
+            delete_ranges.push(Selection {
+                id: sel.id,
+                start: range.start,
+                end: range.end,
+                reversed: false,
+                goal: sel.goal,
+            });
+        }
+
+        ClipboardData {
+            text,
+            selections,
+            delete_ranges,
+        }
+    }
+
     /// The primary selection resolved to byte offsets.
     pub fn primary_resolved(&self) -> Selection<usize> {
         let snap = self.inner.snapshot();
@@ -248,6 +319,20 @@ fn anchorize(snap: &BufferSnapshot, s: &Selection<usize>) -> Selection<Anchor> {
     }
 }
 
+fn line_range_for_offset(text: &Rope, offset: usize) -> (Range<usize>, bool) {
+    let row = text.offset_to_point(offset).row;
+    let start = text.point_to_offset(Point::new(row, 0));
+    let max = text.max_point();
+    if row < max.row {
+        (start..text.point_to_offset(Point::new(row + 1, 0)), false)
+    } else {
+        (
+            start..text.point_to_offset(Point::new(row, line_content_len(text, row))),
+            true,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +432,38 @@ mod tests {
         let n = b.len();
         b.set_selections(vec![span(id, 0, n)], id);
         assert_eq!(b.selected_texts(), vec!["hello\nworld".to_string()]);
+    }
+
+    #[test]
+    fn clipboard_data_empty_cursor_copies_current_line_including_newline() {
+        let mut b = Buffer::from_str("abc\ndef");
+        b.set_cursor(1);
+        let data = b.clipboard_data();
+        assert_eq!(data.text, "abc\n");
+        assert_eq!(
+            data.selections,
+            vec![ClipboardSelection {
+                len: 4,
+                is_entire_line: true,
+            }]
+        );
+        assert_eq!(data.delete_ranges[0].start..data.delete_ranges[0].end, 0..4);
+    }
+
+    #[test]
+    fn clipboard_data_last_line_adds_trailing_newline_without_deleting_one() {
+        let mut b = Buffer::from_str("abc\ndef");
+        b.set_cursor(5);
+        let data = b.clipboard_data();
+        assert_eq!(data.text, "def\n");
+        assert_eq!(
+            data.selections,
+            vec![ClipboardSelection {
+                len: 4,
+                is_entire_line: true,
+            }]
+        );
+        assert_eq!(data.delete_ranges[0].start..data.delete_ranges[0].end, 4..7);
     }
 
     #[test]

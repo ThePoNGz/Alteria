@@ -53,6 +53,8 @@ pub enum Action {
     InsertNewline,
     /// Delete the char before each cursor's head (no-op at start).
     DeleteBackward,
+    /// Delete the char after each cursor's head (no-op at end).
+    DeleteForward,
     /// `Esc` — collapse selection spans and drop to the primary cursor.
     CollapseSelection,
     /// Run `motion` `count` times; `extend` keeps the anchor (the resolver
@@ -70,6 +72,21 @@ pub enum Action {
     Expand(Expansion),
     /// `Alt+Ctrl` `W`/`S` — spawn a cursor above/below (provisional spec).
     SpawnCursor(Direction),
+    /// Select the whole buffer.
+    SelectAll,
+    /// Copy selected text to the OS clipboard (frontend effect).
+    Copy,
+    /// Copy selected text to the OS clipboard, then delete it.
+    Cut,
+    /// Read text from the OS clipboard and paste it (frontend effect).
+    Paste,
+    /// Move by one viewport page. `rows == 0` asks the frontend to provide the
+    /// current visible-row count; nonzero rows are executable in the core.
+    MovePage {
+        direction: Direction,
+        extend: bool,
+        rows: usize,
+    },
     /// `Ctrl+Z` — step back one entry in the history.
     Undo,
     /// `Ctrl+Y` / `Ctrl+Shift+Z` — step forward one entry in the history

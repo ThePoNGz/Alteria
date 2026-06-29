@@ -22,11 +22,36 @@ pub mod keymap;
 pub mod resolver;
 pub mod selection;
 
-use buffer::Buffer;
+use action::{Action, Direction};
+use buffer::{Buffer, ClipboardSelection};
 use history::History;
 use input::InputEvent;
 use keymap::Keymap;
 use resolver::Resolver;
+
+/// The result of handling one input event.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct HandleResult {
+    /// True when the rendered buffer/selection changed and the view should redraw.
+    pub redraw: bool,
+    /// A frontend-owned side effect requested by the core.
+    pub effect: Option<EditorEffect>,
+}
+
+/// Effects that cannot happen inside `alteria-core`.
+#[derive(Clone, PartialEq, Debug)]
+pub enum EditorEffect {
+    /// Write `text` to the OS clipboard.
+    CopyToClipboard {
+        text: String,
+        selections: Vec<ClipboardSelection>,
+    },
+    /// Read the OS clipboard and feed it back through `InputEvent::InsertText`
+    /// or `Action::InsertTexts`.
+    ReadClipboardAndPaste,
+    /// Re-run the page move with the frontend's current visible-row count.
+    MovePage { direction: Direction, extend: bool },
+}
 
 /// The editor facade: ties the resolver, keymap, buffer, and history together.
 ///
@@ -53,17 +78,118 @@ impl Editor {
         }
     }
 
-    /// Feed one raw input event. Returns `true` if the view should redraw
-    /// (i.e. an action was executed).
-    pub fn handle(&mut self, event: InputEvent) -> bool {
+    /// Feed one raw input event and return redraw/effect information.
+    pub fn handle_result(&mut self, event: InputEvent) -> HandleResult {
         match self.resolver.resolve(event, &self.keymap) {
+            Some(Action::Copy) => HandleResult {
+                redraw: false,
+                effect: Some(self.clipboard_effect()),
+            },
+            Some(Action::Cut) => {
+                let effect = self.clipboard_effect();
+                let data = self.buffer.clipboard_data();
+                let before = self.buffer.selection.clone();
+                let primary_id = self.buffer.primary_id();
+                executor::delete_resolved_ranges(
+                    &mut self.buffer,
+                    &mut self.history,
+                    before,
+                    primary_id,
+                    data.delete_ranges,
+                );
+                HandleResult {
+                    redraw: true,
+                    effect: Some(effect),
+                }
+            }
+            Some(Action::Paste) => HandleResult {
+                redraw: false,
+                effect: Some(EditorEffect::ReadClipboardAndPaste),
+            },
+            Some(Action::MovePage {
+                direction,
+                extend,
+                rows: 0,
+            }) => HandleResult {
+                redraw: false,
+                effect: Some(EditorEffect::MovePage { direction, extend }),
+            },
             Some(action) => {
                 executor::apply(action, &mut self.buffer, &mut self.history);
-                true
+                HandleResult {
+                    redraw: true,
+                    effect: None,
+                }
             }
-            None => false,
+            None => HandleResult::default(),
         }
     }
+
+    /// Apply a page move after the frontend has computed the current visible-row
+    /// count from viewport height and line height.
+    pub fn move_page(&mut self, direction: Direction, extend: bool, rows: usize) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        executor::apply(
+            Action::MovePage {
+                direction,
+                extend,
+                rows,
+            },
+            &mut self.buffer,
+            &mut self.history,
+        );
+        true
+    }
+
+    /// Paste clipboard text with optional per-selection byte lengths from Zed
+    /// clipboard metadata. Count mismatch falls back to inserting the whole text
+    /// at every cursor, matching Zed `do_paste`.
+    pub fn paste_clipboard(&mut self, text: String, lengths: Option<Vec<usize>>) -> bool {
+        let action = lengths
+            .and_then(|lengths| split_clipboard_text(&text, &lengths))
+            .map(Action::InsertTexts)
+            .unwrap_or(Action::InsertText(text));
+        executor::apply(action, &mut self.buffer, &mut self.history);
+        true
+    }
+
+    /// Feed one raw input event. Returns `true` if the view should redraw.
+    /// Compatibility wrapper for existing frontend code; callers that need OS
+    /// effects should use [`Editor::handle_result`].
+    pub fn handle(&mut self, event: InputEvent) -> bool {
+        self.handle_result(event).redraw
+    }
+
+    fn clipboard_effect(&self) -> EditorEffect {
+        let data = self.buffer.clipboard_data();
+        EditorEffect::CopyToClipboard {
+            text: data.text,
+            selections: data.selections,
+        }
+    }
+}
+
+fn split_clipboard_text(text: &str, lengths: &[usize]) -> Option<Vec<String>> {
+    let mut start: usize = 0;
+    let mut pieces = Vec::with_capacity(lengths.len());
+    for (ix, len) in lengths.iter().copied().enumerate() {
+        let end = start.checked_add(len)?;
+        if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        pieces.push(text[start..end].to_string());
+        start = end;
+        if ix + 1 < lengths.len() {
+            if text[start..].starts_with('\n') {
+                start += 1;
+            } else {
+                return None;
+            }
+        }
+    }
+    (start == text.len()).then_some(pieces)
 }
 
 #[cfg(test)]
@@ -110,6 +236,20 @@ mod tests {
         fn key(&mut self, ch: char, mods: Modifiers) -> bool {
             self.handle(InputEvent::KeyDown {
                 key: Key::Char(ch),
+                mods,
+                repeat: false,
+            })
+        }
+        fn named(&mut self, key: Key, mods: Modifiers) -> bool {
+            self.handle(InputEvent::KeyDown {
+                key,
+                mods,
+                repeat: false,
+            })
+        }
+        fn named_result(&mut self, key: Key, mods: Modifiers) -> HandleResult {
+            self.handle_result(InputEvent::KeyDown {
+                key,
                 mods,
                 repeat: false,
             })
@@ -272,6 +412,88 @@ mod tests {
         let mut e = Editor::new("abc");
         assert!(!e.handle(InputEvent::ModifiersChanged { mods: ALT }));
         assert!(!e.handle(InputEvent::FocusLost));
+    }
+
+    #[test]
+    fn base_delete_forward_through_the_facade() {
+        let mut e = Editor::new("abc");
+        e.hold(ALT);
+        e.key('d', ALT); // cursor at 1
+        e.release();
+        assert!(e.named(Key::Delete, Modifiers::NONE));
+        assert_eq!(e.buffer.text(), "ac");
+        assert_eq!(e.head(), 1);
+    }
+
+    #[test]
+    fn base_arrow_and_shift_arrow_through_the_facade() {
+        let mut e = Editor::new("abc");
+        assert!(e.named(Key::ArrowRight, Modifiers::NONE));
+        assert_eq!(e.head(), 1);
+        assert!(e.named(
+            Key::ArrowRight,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        ));
+        assert_eq!(e.span(), (1, 2));
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_through_the_facade() {
+        let mut e = Editor::new("abc");
+        e.hold(CTRL);
+        assert!(e.key('a', CTRL));
+        assert_eq!(e.span(), (0, 3));
+    }
+
+    #[test]
+    fn ctrl_c_empty_selection_copies_current_line_effect() {
+        let mut e = Editor::new("abc\ndef");
+        e.hold(CTRL);
+        let result = e.named_result(Key::Char('c'), CTRL);
+        assert_eq!(
+            result.effect,
+            Some(EditorEffect::CopyToClipboard {
+                text: "abc\n".to_string(),
+                selections: vec![buffer::ClipboardSelection {
+                    len: 4,
+                    is_entire_line: true,
+                }],
+            })
+        );
+        assert!(!result.redraw);
+    }
+
+    #[test]
+    fn ctrl_x_empty_selection_cuts_current_line_and_copies_it() {
+        let mut e = Editor::new("abc\ndef");
+        e.hold(CTRL);
+        let result = e.named_result(Key::Char('x'), CTRL);
+        assert_eq!(e.buffer.text(), "def");
+        assert_eq!(e.head(), 0);
+        assert!(result.redraw);
+        assert_eq!(
+            result.effect,
+            Some(EditorEffect::CopyToClipboard {
+                text: "abc\n".to_string(),
+                selections: vec![buffer::ClipboardSelection {
+                    len: 4,
+                    is_entire_line: true,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn paste_clipboard_distributes_matching_metadata_lengths() {
+        let mut e = Editor::new("a\nb");
+        e.hold(ALT_CTRL);
+        e.key('s', ALT_CTRL);
+        e.release();
+        assert!(e.paste_clipboard("xx\nyy".to_string(), Some(vec![2, 2])));
+        assert_eq!(e.buffer.text(), "xxa\nyyb");
     }
 
     // ---- motion fidelity, end-to-end (plan 003) ------------------------

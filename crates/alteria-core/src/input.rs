@@ -34,8 +34,17 @@ impl Modifiers {
 pub enum Key {
     Char(char),
     Backspace,
+    Delete,
     Enter,
     Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 }
 
 /// One raw input event from the frontend.

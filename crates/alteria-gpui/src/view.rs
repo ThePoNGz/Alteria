@@ -18,10 +18,10 @@
 //! `editor/src/element/mouse.rs` wheel handler and `scroll/autoscroll.rs`.
 
 use alteria_core::input::InputEvent;
-use alteria_core::Editor;
+use alteria_core::{Editor, EditorEffect};
 use gpui::{
-    div, prelude::*, px, rgb, Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent,
-    ModifiersChangedEvent, Pixels, ScrollWheelEvent, Window,
+    div, prelude::*, px, rgb, Bounds, ClipboardEntry, ClipboardItem, Context, FocusHandle,
+    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, ScrollWheelEvent, Window,
 };
 
 use crate::event;
@@ -116,9 +116,59 @@ impl EditorView {
     /// cursor in view, then redraw.
     fn feed(&mut self, input: Option<InputEvent>, window: &Window, cx: &mut Context<Self>) {
         if let Some(input) = input {
-            if self.editor.handle(input) {
+            let result = self.editor.handle_result(input);
+            let effect_redraw = result
+                .effect
+                .map(|effect| self.handle_effect(effect, window, cx))
+                .unwrap_or(false);
+            if result.redraw || effect_redraw {
                 self.autoscroll_to_cursor(window);
                 cx.notify();
+            }
+        }
+    }
+
+    fn handle_effect(
+        &mut self,
+        effect: EditorEffect,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match effect {
+            EditorEffect::CopyToClipboard { text, selections } => {
+                let metadata: Vec<(usize, bool)> = selections
+                    .into_iter()
+                    .map(|selection| (selection.len, selection.is_entire_line))
+                    .collect();
+                cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(text, metadata));
+                false
+            }
+            EditorEffect::ReadClipboardAndPaste => {
+                let Some(item) = cx.read_from_clipboard() else {
+                    return false;
+                };
+                let clipboard_string = item.entries().iter().find_map(|entry| match entry {
+                    ClipboardEntry::String(s) => Some(s),
+                    _ => None,
+                });
+                let (text, lengths) = match clipboard_string {
+                    Some(s) => (
+                        s.text().to_string(),
+                        s.metadata_json::<Vec<(usize, bool)>>()
+                            .map(|metadata| metadata.into_iter().map(|(len, _)| len).collect()),
+                    ),
+                    None => {
+                        let Some(text) = item.text() else {
+                            return false;
+                        };
+                        (text, None)
+                    }
+                };
+                self.editor.paste_clipboard(text, lengths)
+            }
+            EditorEffect::MovePage { direction, extend } => {
+                let rows = self.page_row_count(window);
+                self.editor.move_page(direction, extend, rows)
             }
         }
     }
@@ -150,6 +200,13 @@ impl EditorView {
 
     fn line_count(&self) -> usize {
         self.editor.buffer.text().split('\n').count()
+    }
+
+    fn page_row_count(&self, window: &Window) -> usize {
+        scroll::page_row_count(
+            f32::from(self.viewport_height(window)),
+            f32::from(window.line_height()),
+        )
     }
 }
 

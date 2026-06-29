@@ -9,7 +9,7 @@
 //! Base layer (typing) instantly — there is no mode to get stuck in, so a
 //! modifier-release or focus-loss always clears Alt-gated state.
 
-use crate::action::Action;
+use crate::action::{Action, Direction, Motion};
 use crate::input::{InputEvent, Key, Modifiers};
 use crate::keymap::Keymap;
 
@@ -168,7 +168,48 @@ impl Resolver {
                 Key::Char(c) => Action::InsertChar(c),
                 Key::Enter => Action::InsertNewline,
                 Key::Backspace => Action::DeleteBackward,
+                Key::Delete => Action::DeleteForward,
                 Key::Escape => Action::CollapseSelection,
+                Key::ArrowLeft => Action::Move {
+                    motion: Motion::Char(Direction::Left),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::ArrowRight => Action::Move {
+                    motion: Motion::Char(Direction::Right),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::ArrowUp => Action::Move {
+                    motion: Motion::Char(Direction::Up),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::ArrowDown => Action::Move {
+                    motion: Motion::Char(Direction::Down),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::Home => Action::Move {
+                    motion: Motion::LineEdge(Direction::Left),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::End => Action::Move {
+                    motion: Motion::LineEdge(Direction::Right),
+                    extend: self.held.shift,
+                    count: 1,
+                },
+                Key::PageUp => Action::MovePage {
+                    direction: Direction::Up,
+                    extend: self.held.shift,
+                    rows: 0,
+                },
+                Key::PageDown => Action::MovePage {
+                    direction: Direction::Down,
+                    extend: self.held.shift,
+                    rows: 0,
+                },
             });
         }
 
@@ -191,8 +232,6 @@ fn command_char(key: Key) -> Key {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::{Direction, Motion};
-
     const ALT: Modifiers = Modifiers {
         alt: true,
         ctrl: false,
@@ -277,8 +316,84 @@ mod tests {
             Some(Action::DeleteBackward)
         );
         assert_eq!(
+            r.resolve(down(Key::Delete, Modifiers::NONE), &k),
+            Some(Action::DeleteForward)
+        );
+        assert_eq!(
             r.resolve(down(Key::Escape, Modifiers::NONE), &k),
             Some(Action::CollapseSelection)
+        );
+    }
+
+    #[test]
+    fn arrow_keys_are_base_motions() {
+        let mut r = Resolver::new();
+        let k = km();
+        assert_eq!(
+            r.resolve(down(Key::ArrowLeft, Modifiers::NONE), &k),
+            mv(Motion::Char(Direction::Left), false, 1)
+        );
+        assert_eq!(
+            r.resolve(down(Key::ArrowRight, Modifiers::NONE), &k),
+            mv(Motion::Char(Direction::Right), false, 1)
+        );
+        assert_eq!(
+            r.resolve(down(Key::ArrowUp, Modifiers::NONE), &k),
+            mv(Motion::Char(Direction::Up), false, 1)
+        );
+        assert_eq!(
+            r.resolve(down(Key::ArrowDown, Modifiers::NONE), &k),
+            mv(Motion::Char(Direction::Down), false, 1)
+        );
+    }
+
+    #[test]
+    fn shift_arrow_keys_extend_base_motions() {
+        let mut r = Resolver::new();
+        let k = km();
+        assert_eq!(
+            r.resolve(down(Key::ArrowRight, SHIFT), &k),
+            mv(Motion::Char(Direction::Right), true, 1)
+        );
+        assert_eq!(
+            r.resolve(down(Key::ArrowDown, SHIFT), &k),
+            mv(Motion::Char(Direction::Down), true, 1)
+        );
+    }
+
+    #[test]
+    fn home_end_are_base_line_edge_motions() {
+        let mut r = Resolver::new();
+        let k = km();
+        assert_eq!(
+            r.resolve(down(Key::Home, Modifiers::NONE), &k),
+            mv(Motion::LineEdge(Direction::Left), false, 1)
+        );
+        assert_eq!(
+            r.resolve(down(Key::End, SHIFT), &k),
+            mv(Motion::LineEdge(Direction::Right), true, 1)
+        );
+    }
+
+    #[test]
+    fn page_keys_request_frontend_page_rows() {
+        let mut r = Resolver::new();
+        let k = km();
+        assert_eq!(
+            r.resolve(down(Key::PageUp, Modifiers::NONE), &k),
+            Some(Action::MovePage {
+                direction: Direction::Up,
+                extend: false,
+                rows: 0,
+            })
+        );
+        assert_eq!(
+            r.resolve(down(Key::PageDown, SHIFT), &k),
+            Some(Action::MovePage {
+                direction: Direction::Down,
+                extend: true,
+                rows: 0,
+            })
         );
     }
 
@@ -529,6 +644,26 @@ mod tests {
         assert_eq!(
             r.resolve(down(Key::Char('z'), CTRL), &k),
             Some(Action::Undo)
+        );
+    }
+
+    #[test]
+    fn ctrl_a_c_x_v_resolve_to_standard_editor_actions() {
+        let mut r = Resolver::new();
+        let k = km();
+        r.resolve(mods_changed(CTRL), &k);
+        assert_eq!(
+            r.resolve(down(Key::Char('a'), CTRL), &k),
+            Some(Action::SelectAll)
+        );
+        assert_eq!(
+            r.resolve(down(Key::Char('c'), CTRL), &k),
+            Some(Action::Copy)
+        );
+        assert_eq!(r.resolve(down(Key::Char('x'), CTRL), &k), Some(Action::Cut));
+        assert_eq!(
+            r.resolve(down(Key::Char('v'), CTRL), &k),
+            Some(Action::Paste)
         );
     }
 

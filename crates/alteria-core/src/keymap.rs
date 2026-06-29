@@ -93,6 +93,10 @@ impl Keymap {
         layers.insert(ALT_SHIFT, alt_shift);
 
         let mut ctrl = Layer::new();
+        ctrl.bind(Key::Char('a'), Action::SelectAll);
+        ctrl.bind(Key::Char('c'), Action::Copy);
+        ctrl.bind(Key::Char('x'), Action::Cut);
+        ctrl.bind(Key::Char('v'), Action::Paste);
         ctrl.bind(Key::Char('z'), Action::Undo);
         ctrl.bind(Key::Char('y'), Action::Redo);
         layers.insert(CTRL, ctrl);
@@ -235,6 +239,19 @@ mod tests {
     #[test]
     fn ctrl_z_is_undo() {
         assert_eq!(km().lookup(CTRL, Key::Char('z')), Some(Action::Undo));
+    }
+
+    #[test]
+    fn ctrl_a_is_select_all() {
+        assert_eq!(km().lookup(CTRL, Key::Char('a')), Some(Action::SelectAll));
+    }
+
+    #[test]
+    fn ctrl_clipboard_bindings_match_zed_linux() {
+        let k = km();
+        assert_eq!(k.lookup(CTRL, Key::Char('c')), Some(Action::Copy));
+        assert_eq!(k.lookup(CTRL, Key::Char('x')), Some(Action::Cut));
+        assert_eq!(k.lookup(CTRL, Key::Char('v')), Some(Action::Paste));
     }
 
     #[test]

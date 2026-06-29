@@ -35,6 +35,16 @@ pub(crate) fn visible_row_count(viewport_height: f32, line_height: f32) -> usize
     (viewport_height / line_height).ceil() as usize + 1
 }
 
+/// Rows moved by PageUp/PageDown. Zed's `visible_row_count()` is the visible line
+/// count minus one row, so page movement leaves one row of continuity.
+pub(crate) fn page_row_count(viewport_height: f32, line_height: f32) -> usize {
+    if line_height <= 0.0 || viewport_height <= 0.0 {
+        return 1;
+    }
+    let visible_lines = (viewport_height / line_height).floor() as usize;
+    visible_lines.saturating_sub(1).max(1)
+}
+
 /// Clamp ceiling for `scroll_top`: never scroll past the last line. At the max the
 /// last line rests at the bottom of the viewport. A document shorter than the
 /// viewport yields `0` (nothing to scroll). Mirrors Zed's `scroll.rs` clamp.
@@ -126,6 +136,18 @@ mod tests {
         assert_eq!(visible_row_count(VP, LH), 6);
         // 4.5 lines -> ceil 5, +1 = 6.
         assert_eq!(visible_row_count(90.0, LH), 6);
+    }
+
+    #[test]
+    fn page_row_count_is_visible_lines_minus_one() {
+        assert_eq!(page_row_count(VP, LH), 4);
+        assert_eq!(page_row_count(90.0, LH), 3);
+    }
+
+    #[test]
+    fn page_row_count_keeps_at_least_one_row() {
+        assert_eq!(page_row_count(10.0, LH), 1);
+        assert_eq!(page_row_count(0.0, LH), 1);
     }
 
     #[test]

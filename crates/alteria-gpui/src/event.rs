@@ -51,8 +51,17 @@ fn on_modifier_layer(mods: Modifiers) -> bool {
 fn translate_key(key: &str, key_char: Option<&str>, mods: Modifiers) -> Option<Key> {
     match key {
         "backspace" => return Some(Key::Backspace),
+        "delete" => return Some(Key::Delete),
         "enter" | "return" => return Some(Key::Enter),
         "escape" => return Some(Key::Escape),
+        "up" => return Some(Key::ArrowUp),
+        "down" => return Some(Key::ArrowDown),
+        "left" => return Some(Key::ArrowLeft),
+        "right" => return Some(Key::ArrowRight),
+        "home" => return Some(Key::Home),
+        "end" => return Some(Key::End),
+        "pageup" => return Some(Key::PageUp),
+        "pagedown" => return Some(Key::PageDown),
         _ => {}
     }
 
@@ -148,9 +157,18 @@ mod tests {
     fn named_keys_map_in_any_layer() {
         for mods in [NONE, ALT] {
             assert_eq!(translate_key("backspace", None, mods), Some(Key::Backspace));
+            assert_eq!(translate_key("delete", None, mods), Some(Key::Delete));
             assert_eq!(translate_key("enter", None, mods), Some(Key::Enter));
             assert_eq!(translate_key("return", None, mods), Some(Key::Enter));
             assert_eq!(translate_key("escape", None, mods), Some(Key::Escape));
+            assert_eq!(translate_key("up", None, mods), Some(Key::ArrowUp));
+            assert_eq!(translate_key("down", None, mods), Some(Key::ArrowDown));
+            assert_eq!(translate_key("left", None, mods), Some(Key::ArrowLeft));
+            assert_eq!(translate_key("right", None, mods), Some(Key::ArrowRight));
+            assert_eq!(translate_key("home", None, mods), Some(Key::Home));
+            assert_eq!(translate_key("end", None, mods), Some(Key::End));
+            assert_eq!(translate_key("pageup", None, mods), Some(Key::PageUp));
+            assert_eq!(translate_key("pagedown", None, mods), Some(Key::PageDown));
         }
     }
 

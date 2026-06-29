@@ -3,7 +3,10 @@
 **Date:** 2026-06-29
 **Plan:** `plans/010-base-editor-layer.md`
 **Branch:** `alteria_a10`
-**Status:** In progress. T0 audit complete; T1 keymap spec started.
+**Status:** In progress. T0/T1 committed. T2-T5 core/frontend subset implemented:
+Zed Linux base keys, forward Delete, arrows, Shift-arrows, Home/End,
+Ctrl+A/C/X/V, page-row movement, and OS clipboard routing are wired. Mouse
+selection and platform `InputHandler`/IME remain.
 
 ## T0 Runtime Audit
 
@@ -66,3 +69,61 @@ deletion/motion (`ctrl-backspace`, `ctrl-delete`, `ctrl-left`, `ctrl-right` and
 shift variants), document start/end, line select, formatting, code actions,
 signature help, git/diff/editor UI commands, character palette, and line-number
 toggles. Those are outside plan 010's selected normal-editor subset.
+
+## T2-T5 Implemented Subset
+
+### Core input/action surface
+
+- Added plain-data `Key` variants for Delete, arrows, Home/End, and PageUp/PageDown.
+- Added `Action` variants for forward delete, select-all, copy/cut/paste effects,
+  and page movement with a frontend-supplied row count.
+- Resolver behavior now mirrors the selected Zed Linux bindings:
+  - no Alt/Ctrl/Super: Delete, arrows, Shift-arrows, Home/End, Shift-Home/End;
+  - PageUp/PageDown request a frontend page-row count;
+  - Ctrl+A/C/X/V dispatch standard editor actions;
+  - existing Alt quasimode bindings still win when Alt is held.
+
+### Movement, delete, select-all
+
+- `Delete` mirrors Zed `editor.rs::delete`: if a selection is non-empty, delete
+  the span; otherwise extend one grapheme right and replace with `""`.
+- Arrow movement reuses the existing Zed-style single-buffer motion layer:
+  grapheme-aware left/right, goal-column vertical motion, and Shift extension.
+- Home/End reuse `Motion::LineEdge`. This is the logical-line subset; Zed's
+  soft-wrap and indent-stop flags remain display-map/indent debt.
+- `Ctrl+A` selects `0..buffer.len()` as the single-buffer equivalent of
+  Zed `Anchor::Min..Anchor::Max`.
+
+### Page movement
+
+- Page keys resolve to `Action::MovePage { rows: 0 }`, which the facade returns
+  as `EditorEffect::MovePage`.
+- `alteria-gpui` computes the Zed subset of `visible_row_count()`: visible full
+  lines minus one row, at least one row, from viewport height / line height.
+- Core applies that row count through the same vertical goal motion used by Up/Down.
+
+### Clipboard
+
+- `Editor::handle_result` preserves the old `handle() -> bool` wrapper while
+  exposing frontend effects for OS clipboard/page work.
+- Copy/cut gather uses Zed's empty-selection rule: empty selections copy/cut the
+  whole current line, adding a trailing newline for a last line without one.
+- Cut deletes explicit resolved ranges while preserving the original pre-cut
+  selection as the undo selection.
+- GPUI writes clipboard text with JSON metadata shaped as `(len, is_entire_line)`
+  per copied selection, and paste reads that metadata from `ClipboardEntry::String`.
+- Matching metadata lengths distribute paste text per cursor; count mismatch or
+  invalid metadata falls back to inserting the whole clipboard at every cursor.
+
+Temporary clipboard debt: the metadata preserves `is_entire_line`, but paste does
+not yet use that flag to implement Zed's "paste copied lines before the current
+line" behavior. That is smaller than the remaining mouse/IME work and should be
+closed before calling plan 010 complete.
+
+## Verification So Far
+
+| Check | Result |
+|---|---|
+| `cargo test -p alteria-core` | pass: 195 tests |
+| `cargo test -p alteria-gpui` | pass: 29 tests |
+| `git diff --check` | clean |
