@@ -3,11 +3,11 @@
 **Date:** 2026-06-29
 **Plan:** `plans/010-base-editor-layer.md`
 **Branch:** `alteria_a10`
-**Status:** In progress. T0/T1 committed. T2-T7 core/frontend subset implemented:
-Zed Linux base keys, forward Delete, arrows, Shift-arrows, Home/End,
+**Status:** Implemented with automated checks clean; pending a hands-on runtime
+pass. Zed Linux base keys, forward Delete, arrows, Shift-arrows, Home/End,
 Ctrl+A/C/X/V, page-row movement, and OS clipboard routing are wired. Mouse
-click/drag selection is wired. Platform committed text now enters through
-GPUI `EntityInputHandler`; marked-text IME preedit remains.
+click/drag selection is wired. Platform committed text enters through GPUI
+`EntityInputHandler`; marked-text IME preedit remains.
 
 ## T0 Runtime Audit
 
@@ -113,13 +113,15 @@ toggles. Those are outside plan 010's selected normal-editor subset.
   selection as the undo selection.
 - GPUI writes clipboard text with JSON metadata shaped as `(len, is_entire_line)`
   per copied selection, and paste reads that metadata from `ClipboardEntry::String`.
-- Matching metadata lengths distribute paste text per cursor; count mismatch or
-  invalid metadata falls back to inserting the whole clipboard at every cursor.
-
-Temporary clipboard debt: the metadata preserves `is_entire_line`, but paste does
-not yet use that flag to implement Zed's "paste copied lines before the current
-line" behavior. That is smaller than the remaining mouse/IME work and should be
-closed before calling plan 010 complete.
+- Matching metadata lengths distribute paste text per cursor. Count mismatch
+  follows Zed's fallback: use the whole clipboard for each cursor, while still
+  preserving the "all copied selections were full lines" insertion position.
+- Full-line metadata now follows Zed `do_paste`: when the copied slice came from
+  an empty selection/current-line copy and the destination is also empty, paste
+  before the current line rather than at the cursor column.
+- Without metadata, paste mirrors Zed's external-editor fallback: if there are
+  multiple live cursors and the clipboard line count exactly matches, distribute
+  one line per cursor; otherwise paste the whole clipboard at each cursor.
 
 ## T6 Mouse Placement And Drag Selection
 
@@ -156,6 +158,25 @@ special cases, and drag autoscroll at viewport edges.
 Deferred T7 debt: full marked-text/preedit composition is not implemented.
 `replace_and_mark_text_in_range` intentionally does not mutate the buffer; real
 committed text still enters through `replace_text_in_range`.
+
+## T8 Verification
+
+Automated checks after closing the full-line paste metadata path:
+
+| Check | Result |
+|---|---|
+| `cargo test` | pass: `alteria-core` 198 tests, `syntax` 6 tests, vendored crates/doc tests clean |
+| `cargo test -p alteria-gpui` | pass: 35 tests |
+| `cargo build -p alteria-gpui` | pass |
+| `cargo clippy -p alteria-core --all-targets -- -D warnings` | pass |
+| `cargo clippy -p alteria-gpui -- -D warnings` | pass |
+| `cargo tree -p alteria-core` dependency scan | no `gpui` or `ropey` dependency |
+| `cargo run -p alteria-gpui Cargo.toml` | sandboxed launch hit GPUI Wayland `NoCompositor`; unsandboxed launch stayed running until Ctrl-C |
+
+Runtime checklist note: the terminal session verified startup and no immediate
+crash against the host compositor. Hands-on behavior for typing/arrows,
+selection, clipboard, mouse drag, scrolling, and Alt-WASD still needs a human
+pass in the opened window.
 
 ## Verification So Far
 
