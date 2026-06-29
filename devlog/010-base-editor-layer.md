@@ -3,10 +3,11 @@
 **Date:** 2026-06-29
 **Plan:** `plans/010-base-editor-layer.md`
 **Branch:** `alteria_a10`
-**Status:** In progress. T0/T1 committed. T2-T6 core/frontend subset implemented:
+**Status:** In progress. T0/T1 committed. T2-T7 core/frontend subset implemented:
 Zed Linux base keys, forward Delete, arrows, Shift-arrows, Home/End,
 Ctrl+A/C/X/V, page-row movement, and OS clipboard routing are wired. Mouse
-click/drag selection is wired. Platform `InputHandler`/IME remains.
+click/drag selection is wired. Platform committed text now enters through
+GPUI `EntityInputHandler`; marked-text IME preedit remains.
 
 ## T0 Runtime Audit
 
@@ -139,6 +140,23 @@ Deferred Zed mouse behavior: double-click word selection, gutter selection,
 columnar selection, drag-and-drop moving selections, multibuffer/diff/link
 special cases, and drag autoscroll at viewport edges.
 
+## T7 Platform Text Input Seam
+
+- Registered `ElementInputHandler::new(bounds, view)` during text element paint,
+  matching GPUI's current `examples/input.rs` pattern.
+- Implemented `EntityInputHandler` for `EditorView`:
+  - `replace_text_in_range` converts UTF-16 replacement ranges to byte ranges,
+    places the primary selection, then feeds `InputEvent::InsertText`;
+  - selected/text ranges map between byte offsets and UTF-16 code-unit offsets;
+  - `character_index_for_point` reuses the T6 hit-test path and returns UTF-16;
+  - bounds use the same shaped-line x positions as rendering.
+- Raw keydown now drops base-layer printable characters so committed platform
+  text owns ordinary typing; named keys and modifier layers still use raw events.
+
+Deferred T7 debt: full marked-text/preedit composition is not implemented.
+`replace_and_mark_text_in_range` intentionally does not mutate the buffer; real
+committed text still enters through `replace_text_in_range`.
+
 ## Verification So Far
 
 | Check | Result |
@@ -153,3 +171,10 @@ After T6:
 |---|---|
 | `cargo test -p alteria-core` | pass: 196 tests |
 | `cargo test -p alteria-gpui` | pass: 31 tests |
+
+After T7:
+
+| Check | Result |
+|---|---|
+| `cargo test -p alteria-core` | pass: 196 tests |
+| `cargo test -p alteria-gpui` | pass: 35 tests |

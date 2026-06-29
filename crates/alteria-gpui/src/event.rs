@@ -89,6 +89,16 @@ fn single_char(s: &str) -> Option<char> {
 /// Returns `None` for a key the engine has no mapping for (dropped, no redraw).
 pub(crate) fn from_key_down(ev: &KeyDownEvent) -> Option<InputEvent> {
     let mods = map_modifiers(&ev.keystroke.modifiers);
+    if !on_modifier_layer(mods)
+        && ev
+            .keystroke
+            .key_char
+            .as_deref()
+            .and_then(single_char)
+            .is_some()
+    {
+        return None;
+    }
     let key = translate_key(&ev.keystroke.key, ev.keystroke.key_char.as_deref(), mods)?;
     Some(InputEvent::KeyDown {
         key,
@@ -176,6 +186,44 @@ mod tests {
     fn base_layer_falls_back_to_keycap_when_no_key_char() {
         // No reported character (e.g. some platform quirk): use the keycap.
         assert_eq!(translate_key("x", None, NONE), Some(Key::Char('x')));
+    }
+
+    #[test]
+    fn base_layer_printable_keydown_is_left_to_platform_text_input() {
+        let ev = KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                key: "x".into(),
+                key_char: Some("x".into()),
+                ..Default::default()
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert_eq!(from_key_down(&ev), None);
+    }
+
+    #[test]
+    fn modifier_layer_printable_keydown_still_reaches_the_resolver() {
+        let ev = KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: GpuiModifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                key: "w".into(),
+                key_char: Some("w".into()),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert_eq!(
+            from_key_down(&ev),
+            Some(InputEvent::KeyDown {
+                key: Key::Char('w'),
+                mods: ALT,
+                repeat: false,
+            })
+        );
     }
 
     #[test]

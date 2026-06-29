@@ -17,16 +17,18 @@
 //! this file only converts at the `Pixels` boundary. Mirrors Zed's
 //! `editor/src/element/mouse.rs` wheel handler and `scroll/autoscroll.rs`.
 
+use std::ops::Range;
+
 use alteria_core::input::InputEvent;
 use alteria_core::{Editor, EditorEffect};
 use gpui::{
-    div, prelude::*, px, rgb, Bounds, ClipboardEntry, ClipboardItem, Context, FocusHandle,
-    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollWheelEvent, Window,
+    div, prelude::*, px, rgb, Bounds, ClipboardEntry, ClipboardItem, Context, EntityInputHandler,
+    FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, UTF16Selection, Window,
 };
 
 use crate::event;
-use crate::text_element::{offset_for_point, row_col, TextElement};
+use crate::text_element::{line_at_row, offset_for_point, row_col, shape_plain_line, TextElement};
 
 // `scroll.rs` is a top-level frontend file (`src/scroll.rs`, per plan 007), but
 // `main.rs` is off-limits for this plan, so the module is declared here with an
@@ -288,5 +290,179 @@ impl Render for EditorView {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { view: cx.entity() })
+    }
+}
+
+impl EntityInputHandler for EditorView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text = self.editor.buffer.text();
+        let range = utf16_range_to_byte_range(&text, range_utf16);
+        actual_range.replace(byte_range_to_utf16_range(&text, range.clone()));
+        Some(text[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let text = self.editor.buffer.text();
+        let selection = self.editor.buffer.primary_resolved();
+        Some(UTF16Selection {
+            range: byte_range_to_utf16_range(&text, selection.min()..selection.max()),
+            reversed: selection.reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(range_utf16) = range_utf16 {
+            let buffer_text = self.editor.buffer.text();
+            let range = utf16_range_to_byte_range(&buffer_text, range_utf16);
+            self.editor.set_primary_range(range.start, range.end);
+        }
+        if self.editor.handle(InputEvent::InsertText(text.to_string())) {
+            self.autoscroll_to_cursor(window);
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // Full marked-text preedit is deferred. Committed text enters through
+        // `replace_text_in_range`, keeping the real edit path unified.
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let text = self.editor.buffer.text();
+        let range = utf16_range_to_byte_range(&text, range_utf16);
+        let (row, start_col) = row_col(&text, range.start);
+        let (_, end_col) = row_col(&text, range.end);
+        let (_, line) = line_at_row(&text, row);
+        let shaped = shape_plain_line(line, window);
+        let line_height = window.line_height();
+        let y = element_bounds.top() + line_height * row as f32 - self.scroll_top;
+        Some(Bounds::from_corners(
+            gpui::point(element_bounds.left() + shaped.x_for_index(start_col), y),
+            gpui::point(
+                element_bounds.left() + shaped.x_for_index(end_col),
+                y + line_height,
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        let text = self.editor.buffer.text();
+        let offset = offset_for_point(
+            &text,
+            point,
+            bounds,
+            self.scroll_top,
+            window.line_height(),
+            window,
+        );
+        Some(byte_offset_to_utf16_offset(&text, offset))
+    }
+}
+
+fn utf16_range_to_byte_range(text: &str, range: Range<usize>) -> Range<usize> {
+    utf16_offset_to_byte_offset(text, range.start)..utf16_offset_to_byte_offset(text, range.end)
+}
+
+fn byte_range_to_utf16_range(text: &str, range: Range<usize>) -> Range<usize> {
+    byte_offset_to_utf16_offset(text, range.start)..byte_offset_to_utf16_offset(text, range.end)
+}
+
+fn utf16_offset_to_byte_offset(text: &str, target: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, ch) in text.char_indices() {
+        if utf16 >= target {
+            return byte;
+        }
+        utf16 += ch.len_utf16();
+        if utf16 > target {
+            return byte;
+        }
+    }
+    text.len()
+}
+
+fn byte_offset_to_utf16_offset(text: &str, target: usize) -> usize {
+    let target = target.min(text.len());
+    let mut utf16 = 0;
+    for (byte, ch) in text.char_indices() {
+        if target <= byte {
+            return utf16;
+        }
+        if target < byte + ch.len_utf8() {
+            return utf16;
+        }
+        utf16 += ch.len_utf16();
+    }
+    utf16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{byte_offset_to_utf16_offset, utf16_offset_to_byte_offset};
+
+    #[test]
+    fn utf16_to_byte_handles_bmp_and_astral_chars() {
+        let text = "a💙b";
+        assert_eq!(utf16_offset_to_byte_offset(text, 0), 0);
+        assert_eq!(utf16_offset_to_byte_offset(text, 1), 1);
+        assert_eq!(utf16_offset_to_byte_offset(text, 2), 1);
+        assert_eq!(utf16_offset_to_byte_offset(text, 3), 5);
+        assert_eq!(utf16_offset_to_byte_offset(text, 4), 6);
+    }
+
+    #[test]
+    fn byte_to_utf16_counts_code_units() {
+        let text = "a💙b";
+        assert_eq!(byte_offset_to_utf16_offset(text, 0), 0);
+        assert_eq!(byte_offset_to_utf16_offset(text, 1), 1);
+        assert_eq!(byte_offset_to_utf16_offset(text, 2), 1);
+        assert_eq!(byte_offset_to_utf16_offset(text, 5), 3);
+        assert_eq!(byte_offset_to_utf16_offset(text, 6), 4);
     }
 }

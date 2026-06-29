@@ -16,9 +16,9 @@
 
 use alteria_core::selection::Selection;
 use gpui::{
-    fill, point, px, relative, rgba, size, App, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
+    fill, point, px, relative, rgba, size, App, Bounds, ContentMask, Element, ElementId,
+    ElementInputHandler, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
 };
 
 use crate::view::{scroll, EditorView};
@@ -178,9 +178,16 @@ impl Element for TextElement {
     ) {
         // The caret only shows while we hold focus (Zed gates the same way).
         let focused = self.view.read(cx).focus_handle.is_focused(window);
+        let focus_handle = self.view.read(cx).focus_handle.clone();
         let line_height = prepaint.line_height;
         let scroll_top = prepaint.scroll_top;
         let first_row = prepaint.first_row;
+
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
 
         // Clip every draw to the element bounds so a partially-scrolled top or
         // bottom line cannot bleed outside the viewport — Zed masks the text
@@ -329,7 +336,7 @@ pub(crate) fn offset_for_point(
     line_start + col.min(line.len())
 }
 
-fn shape_plain_line(line: &str, window: &mut Window) -> ShapedLine {
+pub(crate) fn shape_plain_line(line: &str, window: &mut Window) -> ShapedLine {
     let style = window.text_style();
     let font_size = style.font_size.to_pixels(window.rem_size());
     let runs = vec![TextRun {
@@ -359,7 +366,7 @@ fn row_for_y(
     ((y / line_height).floor() as usize).min(line_count - 1)
 }
 
-fn line_at_row(text: &str, target_row: usize) -> (usize, &str) {
+pub(crate) fn line_at_row(text: &str, target_row: usize) -> (usize, &str) {
     let mut row = 0;
     let mut start = 0;
     for (i, b) in text.bytes().enumerate() {
