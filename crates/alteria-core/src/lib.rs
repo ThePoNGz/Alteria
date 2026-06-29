@@ -28,6 +28,7 @@ use history::History;
 use input::InputEvent;
 use keymap::Keymap;
 use resolver::Resolver;
+use selection::{Selection, SelectionGoal};
 
 /// The result of handling one input event.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -152,6 +153,48 @@ impl Editor {
             .map(Action::InsertTexts)
             .unwrap_or(Action::InsertText(text));
         executor::apply(action, &mut self.buffer, &mut self.history);
+        true
+    }
+
+    /// Place the primary cursor at a byte offset. Mouse hit testing lives in the
+    /// frontend, but selection mutation stays in the core.
+    pub fn set_cursor(&mut self, offset: usize) -> bool {
+        self.buffer.set_cursor(offset.min(self.buffer.len()));
+        true
+    }
+
+    /// Extend the primary selection's head to a byte offset, keeping its tail.
+    pub fn extend_primary_to(&mut self, offset: usize) -> bool {
+        let offset = offset.min(self.buffer.len());
+        let primary_id = self.buffer.primary_id();
+        let mut resolved = self.buffer.resolved();
+        if let Some(primary) = resolved.iter_mut().find(|sel| sel.id == primary_id) {
+            primary.set_head(offset, SelectionGoal::None);
+        }
+        self.buffer.set_selections(resolved, primary_id);
+        true
+    }
+
+    /// Set the primary selection to `anchor..head`, dropping secondary cursors.
+    pub fn set_primary_range(&mut self, anchor: usize, head: usize) -> bool {
+        let anchor = anchor.min(self.buffer.len());
+        let head = head.min(self.buffer.len());
+        let id = self.buffer.primary_id();
+        let (start, end, reversed) = if head >= anchor {
+            (anchor, head, false)
+        } else {
+            (head, anchor, true)
+        };
+        self.buffer.set_selections(
+            vec![Selection {
+                id,
+                start,
+                end,
+                reversed,
+                goal: SelectionGoal::None,
+            }],
+            id,
+        );
         true
     }
 
@@ -494,6 +537,18 @@ mod tests {
         e.release();
         assert!(e.paste_clipboard("xx\nyy".to_string(), Some(vec![2, 2])));
         assert_eq!(e.buffer.text(), "xxa\nyyb");
+    }
+
+    #[test]
+    fn mouse_style_cursor_and_range_methods_update_selection() {
+        let mut e = Editor::new("abcde");
+        assert!(e.set_cursor(2));
+        assert_eq!(e.head(), 2);
+        assert!(e.extend_primary_to(4));
+        assert_eq!(e.span(), (2, 4));
+        assert!(e.set_primary_range(4, 1));
+        assert_eq!(e.span(), (1, 4));
+        assert!(e.buffer.primary_resolved().reversed);
     }
 
     // ---- motion fidelity, end-to-end (plan 003) ------------------------

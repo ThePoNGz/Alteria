@@ -21,11 +21,12 @@ use alteria_core::input::InputEvent;
 use alteria_core::{Editor, EditorEffect};
 use gpui::{
     div, prelude::*, px, rgb, Bounds, ClipboardEntry, ClipboardItem, Context, FocusHandle,
-    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, Pixels, ScrollWheelEvent, Window,
+    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, ScrollWheelEvent, Window,
 };
 
 use crate::event;
-use crate::text_element::{row_col, TextElement};
+use crate::text_element::{offset_for_point, row_col, TextElement};
 
 // `scroll.rs` is a top-level frontend file (`src/scroll.rs`, per plan 007), but
 // `main.rs` is off-limits for this plan, so the module is declared here with an
@@ -46,6 +47,9 @@ pub(crate) struct EditorView {
     /// so autoscroll/wheel know the viewport height — the `last_bounds` pattern
     /// from gpui's `examples/input.rs`. `None` until the first paint.
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
+    /// Drag anchor in buffer byte offsets while a left-button text selection is
+    /// in progress.
+    mouse_anchor: Option<usize>,
 }
 
 impl EditorView {
@@ -65,6 +69,7 @@ impl EditorView {
             focus_handle,
             scroll_top: px(0.),
             last_bounds: None,
+            mouse_anchor: None,
         }
     }
 
@@ -110,6 +115,43 @@ impl EditorView {
             self.scroll_top = new_top;
             cx.notify();
         }
+    }
+
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        let Some(offset) = self.offset_for_mouse(ev.position, window) else {
+            return;
+        };
+
+        let changed = if ev.modifiers.shift {
+            self.mouse_anchor = Some(self.editor.buffer.primary_resolved().tail());
+            self.editor.extend_primary_to(offset)
+        } else {
+            self.mouse_anchor = Some(offset);
+            self.editor.set_cursor(offset)
+        };
+
+        if changed {
+            self.autoscroll_to_cursor(window);
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(anchor) = self.mouse_anchor else {
+            return;
+        };
+        let Some(offset) = self.offset_for_mouse(ev.position, window) else {
+            return;
+        };
+        if self.editor.set_primary_range(anchor, offset) {
+            self.autoscroll_to_cursor(window);
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.mouse_anchor = None;
     }
 
     /// Hand a translated event to the engine; on a state change, keep the primary
@@ -208,6 +250,22 @@ impl EditorView {
             f32::from(window.line_height()),
         )
     }
+
+    fn offset_for_mouse(
+        &self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+    ) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        Some(offset_for_point(
+            &self.editor.buffer.text(),
+            position,
+            bounds,
+            self.scroll_top,
+            window.line_height(),
+            window,
+        ))
+    }
 }
 
 impl Render for EditorView {
@@ -225,6 +283,10 @@ impl Render for EditorView {
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             // The wheel is an ordinary (non-quasimode) handler.
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { view: cx.entity() })
     }
 }

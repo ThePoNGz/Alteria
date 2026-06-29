@@ -17,8 +17,8 @@
 use alteria_core::selection::Selection;
 use gpui::{
     fill, point, px, relative, rgba, size, App, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, TextAlign, TextRun, Window,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextAlign, TextRun, Window,
 };
 
 use crate::view::{scroll, EditorView};
@@ -300,9 +300,83 @@ pub(crate) fn row_col(text: &str, offset: usize) -> (usize, usize) {
     (row, offset - line_start)
 }
 
+/// Convert a viewport point to a byte offset in `text`, shaping the target line
+/// and asking GPUI for the nearest character boundary. This is the single-buffer
+/// subset of Zed's `PositionMap::point_for_position`.
+pub(crate) fn offset_for_point(
+    text: &str,
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    scroll_top: Pixels,
+    line_height: Pixels,
+    window: &mut Window,
+) -> usize {
+    let line_count = text.split('\n').count();
+    let row = row_for_y(
+        f32::from(position.y),
+        f32::from(bounds.top()),
+        f32::from(scroll_top),
+        f32::from(line_height),
+        line_count,
+    );
+    let (line_start, line) = line_at_row(text, row);
+    let x = (position.x - bounds.left()).max(px(0.));
+    let col = if line.is_empty() {
+        0
+    } else {
+        shape_plain_line(line, window).closest_index_for_x(x)
+    };
+    line_start + col.min(line.len())
+}
+
+fn shape_plain_line(line: &str, window: &mut Window) -> ShapedLine {
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let runs = vec![TextRun {
+        len: line.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    window
+        .text_system()
+        .shape_line(SharedString::from(line.to_string()), font_size, &runs, None)
+}
+
+fn row_for_y(
+    position_y: f32,
+    bounds_top: f32,
+    scroll_top: f32,
+    line_height: f32,
+    line_count: usize,
+) -> usize {
+    if line_height <= 0.0 || line_count == 0 {
+        return 0;
+    }
+    let y = (position_y - bounds_top + scroll_top).max(0.0);
+    ((y / line_height).floor() as usize).min(line_count - 1)
+}
+
+fn line_at_row(text: &str, target_row: usize) -> (usize, &str) {
+    let mut row = 0;
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            if row == target_row {
+                return (start, &text[start..i]);
+            }
+            row += 1;
+            start = i + 1;
+        }
+    }
+    (start, &text[start..])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::row_col;
+    use super::{line_at_row, row_col, row_for_y};
 
     #[test]
     fn row_col_at_start() {
@@ -330,5 +404,21 @@ mod tests {
     fn row_col_at_line_end_before_break() {
         // "ab\ncd": offset 2 is the '\n' position -> still row 0, col 2.
         assert_eq!(row_col("ab\ncd", 2), (0, 2));
+    }
+
+    #[test]
+    fn line_at_row_returns_start_offset_and_line_text() {
+        assert_eq!(line_at_row("ab\ncd\nef", 0), (0, "ab"));
+        assert_eq!(line_at_row("ab\ncd\nef", 1), (3, "cd"));
+        assert_eq!(line_at_row("ab\ncd\nef", 2), (6, "ef"));
+        assert_eq!(line_at_row("ab\n", 1), (3, ""));
+    }
+
+    #[test]
+    fn row_for_y_accounts_for_scroll_and_clamps() {
+        assert_eq!(row_for_y(10.0, 0.0, 0.0, 20.0, 3), 0);
+        assert_eq!(row_for_y(10.0, 0.0, 40.0, 20.0, 3), 2);
+        assert_eq!(row_for_y(999.0, 0.0, 0.0, 20.0, 3), 2);
+        assert_eq!(row_for_y(-20.0, 0.0, 0.0, 20.0, 3), 0);
     }
 }

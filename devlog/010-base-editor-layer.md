@@ -3,10 +3,10 @@
 **Date:** 2026-06-29
 **Plan:** `plans/010-base-editor-layer.md`
 **Branch:** `alteria_a10`
-**Status:** In progress. T0/T1 committed. T2-T5 core/frontend subset implemented:
+**Status:** In progress. T0/T1 committed. T2-T6 core/frontend subset implemented:
 Zed Linux base keys, forward Delete, arrows, Shift-arrows, Home/End,
 Ctrl+A/C/X/V, page-row movement, and OS clipboard routing are wired. Mouse
-selection and platform `InputHandler`/IME remain.
+click/drag selection is wired. Platform `InputHandler`/IME remains.
 
 ## T0 Runtime Audit
 
@@ -120,6 +120,25 @@ not yet use that flag to implement Zed's "paste copied lines before the current
 line" behavior. That is smaller than the remaining mouse/IME work and should be
 closed before calling plan 010 complete.
 
+## T6 Mouse Placement And Drag Selection
+
+- Added core selection placement methods on `Editor`:
+  - `set_cursor(offset)`;
+  - `extend_primary_to(offset)`;
+  - `set_primary_range(anchor, head)`.
+- Added `text_element::offset_for_point`, the single-buffer subset of Zed's
+  `PositionMap::point_for_position`: row from bounds + scroll + line height,
+  column from shaping the target line and using GPUI `closest_index_for_x`.
+- Wired GPUI left-click, Shift-left-click, left-drag, and mouse-up:
+  - click focuses the editor and places the primary cursor;
+  - Shift-click extends the primary selection;
+  - drag keeps the original byte offset as anchor and updates the primary range;
+  - mouse-up ends the pending drag state.
+
+Deferred Zed mouse behavior: double-click word selection, gutter selection,
+columnar selection, drag-and-drop moving selections, multibuffer/diff/link
+special cases, and drag autoscroll at viewport edges.
+
 ## Verification So Far
 
 | Check | Result |
@@ -127,3 +146,10 @@ closed before calling plan 010 complete.
 | `cargo test -p alteria-core` | pass: 195 tests |
 | `cargo test -p alteria-gpui` | pass: 29 tests |
 | `git diff --check` | clean |
+
+After T6:
+
+| Check | Result |
+|---|---|
+| `cargo test -p alteria-core` | pass: 196 tests |
+| `cargo test -p alteria-gpui` | pass: 31 tests |
